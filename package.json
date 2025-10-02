@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 {
   "name": "tv-relay",
   "version": "1.0.0",
@@ -12,3 +13,19 @@
     "start": "node server.js"
   }
 }
+=======
+{
+  "name": "tv-relay",
+  "version": "1.0.0",
+  "main": "server.js",
+  "type": "commonjs",
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "express": "^4.19.2"
+  },
+  "scripts": {
+    "start": "node server.js"
+  }
+}
+>>>>>>> ed7f1f909367e847bc6a04d015357afd0fe68c36
