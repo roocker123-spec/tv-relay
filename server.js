@@ -1,11 +1,12 @@
+// server.js
 require('dotenv').config();
 const express = require('express');
-const crypto = require('crypto');
-const fetch = global.fetch; // Node 18+
+const crypto  = require('crypto');
+const fetch   = global.fetch; // Node 18+
 
 const app = express();
 
-// Accept JSON, urlencoded and raw string; coerce to object
+// ---------- parsing ----------
 app.use(express.json({ type: '*/*' }));
 app.use(express.urlencoded({ extended: true }));
 app.use((req, _res, next) => {
@@ -23,10 +24,12 @@ app.use((req, _res, next) => {
   next();
 });
 
-const API_KEY   = process.env.DELTA_API_KEY;
-const API_SECRET= process.env.DELTA_API_SECRET;
-const BASE_URL  = (process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange').replace(/\/+$/,'');
-const PORT      = process.env.PORT || 3000;
+// ---------- env ----------
+const API_KEY       = process.env.DELTA_API_KEY;
+const API_SECRET    = process.env.DELTA_API_SECRET;
+const BASE_URL      = (process.env.DELTA_BASE || process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange').replace(/\/+$/,'');
+const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || ''; // optional header check
+const PORT          = process.env.PORT || 3000;
 
 function nowTsSec(){ return Math.floor(Date.now()/1000).toString(); }
 function toProductSymbol(sym){
@@ -35,64 +38,174 @@ function toProductSymbol(sym){
   if(s.includes(':')) s = s.split(':').pop();
   return s;
 }
-async function dcall(method, path, payload=null, query=''){
+
+// ---------- Delta request helper (hardened with retries/backoff) ----------
+async function dcall(method, path, payload=null, query='') {
   const body = payload ? JSON.stringify(payload) : '';
-  const ts = nowTsSec();
-  const prehash = method + ts + path + (query||'') + body;
-  const signature = crypto.createHmac('sha256', API_SECRET).update(prehash).digest('hex');
-  const url = BASE_URL + path + (query||'');
-  const headers = {
-    'Content-Type':'application/json','Accept':'application/json',
-    'api-key':API_KEY,'signature':signature,'timestamp':ts,'User-Agent':'tv-relay-node'
-  };
-  const res = await fetch(url,{method,headers,body: body || undefined});
-  const text = await res.text(); let json;
-  try{ json = JSON.parse(text); }catch{ json = { raw:text }; }
-  if(!res.ok || json?.success===false) throw new Error('Delta API error: '+JSON.stringify({url,status:res.status,json}));
-  return json;
+  const MAX_TRIES = 3;
+
+  for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+    const ts   = nowTsSec();
+    const prehash = method + ts + path + (query||'') + body;
+    const signature = crypto.createHmac('sha256', API_SECRET).update(prehash).digest('hex');
+    const url  = BASE_URL + path + (query||'');
+    const headers = {
+      'Content-Type':'application/json','Accept':'application/json',
+      'api-key':API_KEY,'signature':signature,'timestamp':ts,'User-Agent':'tv-relay-node'
+    };
+
+    try {
+      const res  = await fetch(url,{ method, headers, body: body || undefined });
+      const text = await res.text(); let json;
+      try { json = JSON.parse(text); } catch { json = { raw: text }; }
+
+      if (!res.ok || json?.success === false) {
+        const code = json?.error?.code || res.status;
+        if ([429,500,502,503,504].includes(code) && attempt < MAX_TRIES) {
+          await new Promise(r=>setTimeout(r, 300*attempt));
+          continue;
+        }
+        throw new Error(`Delta API error: ${JSON.stringify({ url, status: res.status, json })}`);
+      }
+      return json;
+    } catch (e) {
+      if (attempt === MAX_TRIES) throw e;
+      await new Promise(r=>setTimeout(r, 300*attempt));
+    }
+  }
 }
+
+// ---------- order helpers ----------
 async function placeEntry(m){
-  const side = (m.side||'').toLowerCase()==='buy'?'buy':'sell';
-  const qty = parseInt(m.qty,10); if(!qty||qty<1) throw new Error('qty must be integer >=1');
-  return dcall('POST','/v2/orders',{product_symbol: toProductSymbol(m.symbol), order_type:'market_order', side, size: qty});
+  const side = (m.side||'').toLowerCase()==='buy' ? 'buy' : 'sell';
+  const qty  = parseInt(m.qty,10);
+  if(!qty || qty < 1) throw new Error('qty must be integer >= 1');
+  return dcall('POST','/v2/orders',{
+    product_symbol: toProductSymbol(m.symbol || m.product_symbol),
+    order_type:'market_order',
+    side, size: qty
+  });
 }
 async function placeBracket(m){
   const {action, ...body} = m;
-  if(!body.product_symbol && !body.product_id) body.product_symbol = toProductSymbol(m.product_symbol);
+  if(!body.product_symbol && !body.product_id) body.product_symbol = toProductSymbol(m.product_symbol || m.symbol);
   return dcall('POST','/v2/orders/bracket', body);
 }
 async function placeBatch(m){
   const {action, ...body} = m;
-  if(!body.product_symbol && !body.product_id) body.product_symbol = toProductSymbol(m.product_symbol);
+  if(!body.product_symbol && !body.product_id) body.product_symbol = toProductSymbol(m.product_symbol || m.symbol);
   return dcall('POST','/v2/orders/batch', body);
 }
 
-app.get('/health', (_req,res)=>res.json({ok:true}));
+// ---------- CANCEL/CLOSE + listings (robust) ----------
+const cancelAllOrders   = () => dcall('DELETE','/v2/orders/all');            // no body on DELETE
+const closeAllPositions = () => dcall('POST','/v2/positions/close_all', {});  // explicit {}
 
+async function listOpenOrdersAllPages(){
+  let all = [];
+  let page = 1;
+  while (true){
+    const q = `?states=open,pending&page=${page}&per_page=200`;
+    const oo = await dcall('GET','/v2/orders', null, q);
+    const arr = Array.isArray(oo?.result) ? oo.result
+              : Array.isArray(oo?.orders) ? oo.orders
+              : Array.isArray(oo) ? oo : [];
+    all = all.concat(arr);
+    if (arr.length < 200) break;
+    page++;
+  }
+  return all;
+}
+async function listPositionsArray(){
+  const pos = await dcall('GET','/v2/positions');
+  const arr = Array.isArray(pos?.result?.positions) ? pos.result.positions
+            : Array.isArray(pos?.result) ? pos.result
+            : Array.isArray(pos?.positions) ? pos.positions
+            : Array.isArray(pos) ? pos : [];
+  return arr;
+}
+
+async function waitUntilFlat(timeoutMs = Number(process.env.FLAT_TIMEOUT_MS||15000), pollMs = 400) {
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    try {
+      const oo  = await listOpenOrdersAllPages();
+      const hasOrders = oo.some(o => ['open','pending','triggered','untriggered']
+        .includes(String(o?.state||o?.status||'').toLowerCase()));
+
+      const pos = await listPositionsArray();
+      const hasPos = pos.some(p => Math.abs(Number(p?.size||p?.position_size||0)) > 0);
+
+      if (!hasOrders && !hasPos) return true;
+
+      console.log('…still flattening', {
+        openOrders: oo.length,
+        positions: pos.map(p=>({ product_id:p.product_id, size:p.size }))
+      });
+    } catch(e) {
+      console.warn('waitUntilFlat poll error (ignoring):', e?.message || e);
+    }
+    await new Promise(r => setTimeout(r, pollMs));
+  }
+  return false;
+}
+
+// ---------- health ----------
+app.get('/health', (_req,res)=>res.json({ok:true}));
+app.get('/healthz', (_req,res)=>res.send('ok'));
+
+// ---------- TradingView webhook ----------
 app.post('/tv', async (req, res) => {
-  const raw = (typeof req.body === 'string') ? req.body : JSON.stringify(req.body);
-  console.log('\n=== INCOMING /tv ===\n', raw);
-  try{
-    const msg = (typeof req.body === 'string') ? JSON.parse(req.body) : (req.body||{});
+  try {
+    if (WEBHOOK_TOKEN) {
+      const hdr = req.headers['x-webhook-token'];
+      if (hdr !== WEBHOOK_TOKEN) return res.status(401).json({ ok:false, error:'unauthorized' });
+    }
+
+    const msg    = (typeof req.body === 'string') ? JSON.parse(req.body) : (req.body || {});
+    const action = String(msg.action || '').toUpperCase();
+    console.log('\n=== INCOMING /tv ===\n', JSON.stringify(msg));
+
+    // 0) Explicit cleanup from Pine
+    if (action === 'DELTA_CANCEL_ALL' || action === 'CANCEL_ALL') {
+      const out = await cancelAllOrders();
+      return res.json({ ok:true, did:'cancel_all_orders', delta: out });
+    }
+    if (action === 'CLOSE_POSITION') {
+      const out = await closeAllPositions();
+      return res.json({ ok:true, did:'close_all_positions', delta: out });
+    }
+
+    // 1) Bracket JSON passthrough (if you send from Pine)
     if (msg.stop_loss_order || msg.take_profit_order) {
-      console.log('→ FORWARD: /v2/orders/bracket');
       const r = await placeBracket(msg);
-      console.log('✔ BRACKET OK:', JSON.stringify(r));
-      return res.json({ok:true, step:'bracket', r});
+      return res.json({ ok:true, step:'bracket', r });
     }
+
+    // 2) Batch limits passthrough
     if (msg.orders) {
-      console.log('→ FORWARD: /v2/orders/batch');
       const r = await placeBatch(msg);
-      console.log('✔ BATCH OK:', JSON.stringify(r));
-      return res.json({ok:true, step:'batch', r});
+      return res.json({ ok:true, step:'batch', r });
     }
-    console.log('→ FORWARD: /v2/orders (entry)');
+
+    // 3) ENTER / FLIP: force cancel + close, then gate until flat
+    if (action === 'ENTER' || action === 'FLIP') {
+      try { await cancelAllOrders(); } catch(e) { console.warn('cancelAllOrders failed:', e?.message||e); }
+      try { await closeAllPositions(); } catch(e) { console.warn('closeAllPositions failed:', e?.message||e); }
+
+      const flat = await waitUntilFlat(); // 15s default (env FLAT_TIMEOUT_MS)
+      console.log('flat gate result:', flat);
+      // fall through to placement even if false (belt & suspenders)
+    }
+
+    // 4) Plain market entry (symbol/side/qty required)
     const r = await placeEntry(msg);
-    console.log('✔ ENTRY OK:', JSON.stringify(r));
-    return res.json({ok:true, step:'entry', r});
-  }catch(e){
+    return res.json({ ok:true, step:'entry', r });
+
+  } catch (e) {
     console.error('✖ ERROR:', e);
-    return res.status(400).json({ok:false, error:String(e)});
+    return res.status(400).json({ ok:false, error:String(e.message || e) });
   }
 });
-app.listen(PORT, ()=>console.log(`Relay listening http://localhost:${PORT}`));
+
+app.listen(PORT, ()=>console.log(`Relay listening http://localhost:${PORT} (BASE=${BASE_URL})`));
