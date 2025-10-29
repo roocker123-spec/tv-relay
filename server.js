@@ -25,7 +25,7 @@ app.use((req, _res, next) => {
     const q = parseInt(req.body.qty, 10);
     if (!Number.isNaN(q)) req.body.qty = q;
   }
-  next();
+  next());
 });
 
 /* ----------------------------- env ---------------------------------- */
@@ -35,7 +35,9 @@ const BASE_URL      = (process.env.DELTA_BASE || process.env.DELTA_BASE_URL || '
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || ''; // optional shared secret
 const PORT          = process.env.PORT || 3000;
 
-function nowTsMs(){ return Date.now().toString(); } // ms timestamp (safer across setups)
+/* ---- Delta expects seconds timestamp; millisecond ts caused 401 ---- */
+function nowTsSec(){ return Math.floor(Date.now()/1000).toString(); } // seconds
+
 function toProductSymbol(sym){
   if(!sym) return sym;
   let s = String(sym).replace('.P','');           // TV → Exchange (e.g., CAKEUSD.P -> CAKEUSD)
@@ -50,7 +52,7 @@ async function dcall(method, path, payload=null, query='') {
   const MAX_TRIES = 3;
 
   for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
-    const ts   = nowTsMs();
+    const ts   = nowTsSec(); // << seconds
     const prehash = method + ts + path + (query||'') + body;
     const signature = crypto.createHmac('sha256', API_SECRET).update(prehash).digest('hex');
     const url  = BASE_URL + path + (query||'');
