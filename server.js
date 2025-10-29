@@ -25,7 +25,7 @@ app.use((req, _res, next) => {
     const q = parseInt(req.body.qty, 10);
     if (!Number.isNaN(q)) req.body.qty = q;
   }
-  next());
+  next();
 });
 
 /* ----------------------------- env ---------------------------------- */
@@ -35,7 +35,7 @@ const BASE_URL      = (process.env.DELTA_BASE || process.env.DELTA_BASE_URL || '
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || ''; // optional shared secret
 const PORT          = process.env.PORT || 3000;
 
-/* ---- Delta expects seconds timestamp; millisecond ts caused 401 ---- */
+/* ---- Delta expects **seconds** timestamp ---- */
 function nowTsSec(){ return Math.floor(Date.now()/1000).toString(); } // seconds
 
 function toProductSymbol(sym){
@@ -56,6 +56,7 @@ async function dcall(method, path, payload=null, query='') {
     const prehash = method + ts + path + (query||'') + body;
     const signature = crypto.createHmac('sha256', API_SECRET).update(prehash).digest('hex');
     const url  = BASE_URL + path + (query||'');
+
     const headers = {
       'Content-Type':'application/json',
       'Accept':'application/json',
@@ -64,6 +65,9 @@ async function dcall(method, path, payload=null, query='') {
       'timestamp':ts,
       'User-Agent':'tv-relay-node'
     };
+
+    // -------- DEBUG: timestamp logger (remove after debugging) --------
+    console.log('delta ts =', ts, '(length:', ts.length + ')');
 
     try {
       const res  = await fetch(url,{ method, headers, body: body || undefined });
@@ -286,4 +290,8 @@ app.post('/tv', async (req, res) => {
 });
 
 /* ------------------------------ start ------------------------------- */
-app.listen(PORT, ()=>console.log(`Relay listening on http://localhost:${PORT}  (BASE=${BASE_URL})`));
+app.listen(PORT, ()=>{
+  console.log(`Relay listening on http://localhost:${PORT}  (BASE=${BASE_URL})`);
+  // Helpful to confirm you're running the right file:
+  console.log('Loaded from', require('fs').realpathSync(__filename));
+});
