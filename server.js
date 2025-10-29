@@ -35,7 +35,7 @@ const BASE_URL      = (process.env.DELTA_BASE || process.env.DELTA_BASE_URL || '
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || ''; // optional shared secret
 const PORT          = process.env.PORT || 3000;
 
-function nowTsSec(){ return Math.floor(Date.now()/1000).toString(); }
+function nowTsMs(){ return Date.now().toString(); } // ms timestamp (safer across setups)
 function toProductSymbol(sym){
   if(!sym) return sym;
   let s = String(sym).replace('.P','');           // TV → Exchange (e.g., CAKEUSD.P -> CAKEUSD)
@@ -44,13 +44,13 @@ function toProductSymbol(sym){
 }
 
 /* ----------------------- Delta request helper ----------------------- */
-// Signs per: method + timestamp + path + query + body
+// Signature prehash: method + timestamp + path + query + body
 async function dcall(method, path, payload=null, query='') {
   const body = payload ? JSON.stringify(payload) : '';
   const MAX_TRIES = 3;
 
   for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
-    const ts   = nowTsSec();
+    const ts   = nowTsMs();
     const prehash = method + ts + path + (query||'') + body;
     const signature = crypto.createHmac('sha256', API_SECRET).update(prehash).digest('hex');
     const url  = BASE_URL + path + (query||'');
@@ -210,6 +210,17 @@ async function waitUntilFlat(timeoutMs = Number(process.env.FLAT_TIMEOUT_MS || 1
 app.get('/health', (_req,res)=>res.json({ok:true}));
 app.get('/healthz', (_req,res)=>res.send('ok'));
 
+/* --------------------------- AUTH TEST ------------------------------ */
+// Harmless, read-only private call to verify API key/secret/base/whitelist/clock.
+app.get('/auth-test', async (_req, res) => {
+  try {
+    const r = await dcall('GET','/v2/positions');
+    res.json({ ok: true, sample: r });
+  } catch (e) {
+    res.status(401).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
 /* --------------------------- webhook route -------------------------- */
 app.post('/tv', async (req, res) => {
   try {
@@ -222,14 +233,22 @@ app.post('/tv', async (req, res) => {
     const action = String(msg.action || '').toUpperCase();
     console.log('\n=== INCOMING /tv ===\n', JSON.stringify(msg));
 
-    // Manual cleanup from Pine
+    // Manual cleanup from Pine (return 401 if exchange rejects)
     if (action === 'DELTA_CANCEL_ALL' || action === 'CANCEL_ALL') {
-      const out = await cancelAllOrdersBoth();
-      return res.json({ ok:true, did:'cancel_all_orders_and_stops', delta: out });
+      try {
+        const out = await cancelAllOrdersBoth();
+        return res.json({ ok:true, did:'cancel_all_orders_and_stops', delta: out });
+      } catch (e) {
+        return res.status(401).json({ ok:false, error:String(e.message||e) });
+      }
     }
     if (action === 'CLOSE_POSITION') {
-      const out = await closeAllPositions();
-      return res.json({ ok:true, did:'close_all_positions', delta: out });
+      try {
+        const out = await closeAllPositions();
+        return res.json({ ok:true, did:'close_all_positions', delta: out });
+      } catch (e) {
+        return res.status(401).json({ ok:false, error:String(e.message||e) });
+      }
     }
 
     // Direct bracket passthrough (if your Pine sends a bracket payload)
