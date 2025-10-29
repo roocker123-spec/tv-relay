@@ -3,7 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const crypto  = require('crypto');
 
-// Node 18+ has global fetch
+// Node 18+ global fetch
 const fetch = global.fetch;
 
 const app = express();
@@ -29,11 +29,14 @@ app.use((req, _res, next) => {
 });
 
 /* ----------------------------- env ---------------------------------- */
-const API_KEY       = process.env.DELTA_API_KEY || process.env.API_KEY || '';
-const API_SECRET    = process.env.DELTA_API_SECRET || process.env.API_SECRET || '';
-const BASE_URL      = (process.env.DELTA_BASE || process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange').replace(/\/+$/,'');
-const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || ''; // optional shared secret
+const API_KEY       = (process.env.DELTA_API_KEY    || process.env.API_KEY    || '').trim();
+const API_SECRET    = (process.env.DELTA_API_SECRET || process.env.API_SECRET || '').trim();
+const BASE_URL      = ((process.env.DELTA_BASE || process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange').replace(/\/+$/,'')).trim();
+const WEBHOOK_TOKEN = (process.env.WEBHOOK_TOKEN || '').trim();
 const PORT          = process.env.PORT || 3000;
+
+// mask helper for safe logging
+const mask = k => k ? k.slice(0,4)+'...'+k.slice(-4) : '(empty)';
 
 /* ---- Delta expects **seconds** timestamp ---- */
 function nowTsSec(){ return Math.floor(Date.now()/1000).toString(); } // seconds
@@ -52,7 +55,7 @@ async function dcall(method, path, payload=null, query='') {
   const MAX_TRIES = 3;
 
   for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
-    const ts   = nowTsSec(); // << seconds
+    const ts   = nowTsSec(); // seconds
     const prehash = method + ts + path + (query||'') + body;
     const signature = crypto.createHmac('sha256', API_SECRET).update(prehash).digest('hex');
     const url  = BASE_URL + path + (query||'');
@@ -66,7 +69,7 @@ async function dcall(method, path, payload=null, query='') {
       'User-Agent':'tv-relay-node'
     };
 
-    // -------- DEBUG: timestamp logger (remove after debugging) --------
+    // -------- DEBUG: timestamp logger (remove when done) --------
     console.log('delta ts =', ts, '(length:', ts.length + ')');
 
     try {
@@ -239,7 +242,7 @@ app.post('/tv', async (req, res) => {
     const action = String(msg.action || '').toUpperCase();
     console.log('\n=== INCOMING /tv ===\n', JSON.stringify(msg));
 
-    // Manual cleanup from Pine (return 401 if exchange rejects)
+    // Manual cleanup from Pine
     if (action === 'DELTA_CANCEL_ALL' || action === 'CANCEL_ALL') {
       try {
         const out = await cancelAllOrdersBoth();
@@ -292,6 +295,6 @@ app.post('/tv', async (req, res) => {
 /* ------------------------------ start ------------------------------- */
 app.listen(PORT, ()=>{
   console.log(`Relay listening on http://localhost:${PORT}  (BASE=${BASE_URL})`);
-  // Helpful to confirm you're running the right file:
   console.log('Loaded from', require('fs').realpathSync(__filename));
+  console.log('Using API key:', mask(API_KEY));
 });
