@@ -1,17 +1,25 @@
 {
-  "name": "tv-relay",
+  "name": "delta-ladder-gateway",
   "version": "1.0.0",
-  "description": "TradingView → Delta India relay",
+  "description": "Strict sequencer for Delta Exchange ladder orders",
   "main": "server.js",
-  "type": "commonjs",
+  "type": "module",
   "scripts": {
-    "start": "node server.js"
-  },
-  "engines": {
-    "node": ">=18"
+    "start": "node server.js",
+    "dev": "NODE_ENV=development nodemon server.js"
   },
   "dependencies": {
-    "dotenv": "^16.4.5",
-    "express": "^4.18.2"
+    "axios": "^1.7.7",
+    "body-parser": "^2.2.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "helmet": "^7.1.0",
+    "joi": "^17.13.3",
+    "morgan": "^1.10.0",
+    "pino": "^9.14.0",
+    "pino-http": "^11.0.0",
+    "pino-pretty": "^10.3.1",
+    "uuid": "^9.0.1"
   }
 }
