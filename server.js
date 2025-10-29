@@ -2,13 +2,17 @@
 require('dotenv').config();
 const express = require('express');
 const crypto  = require('crypto');
-const fetch   = global.fetch; // Node 18+
+
+// Node 18+ has global fetch
+const fetch = global.fetch;
 
 const app = express();
 
-// ---------- parsing ----------
+/* ---------------------- parsing & normalization ---------------------- */
 app.use(express.json({ type: '*/*' }));
 app.use(express.urlencoded({ extended: true }));
+
+// Accept raw strings / form-encoded TV payloads too
 app.use((req, _res, next) => {
   if (typeof req.body === 'string') {
     try { req.body = JSON.parse(req.body); }
@@ -24,22 +28,23 @@ app.use((req, _res, next) => {
   next();
 });
 
-// ---------- env ----------
-const API_KEY       = process.env.DELTA_API_KEY;
-const API_SECRET    = process.env.DELTA_API_SECRET;
+/* ----------------------------- env ---------------------------------- */
+const API_KEY       = process.env.DELTA_API_KEY || process.env.API_KEY || '';
+const API_SECRET    = process.env.DELTA_API_SECRET || process.env.API_SECRET || '';
 const BASE_URL      = (process.env.DELTA_BASE || process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange').replace(/\/+$/,'');
-const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || ''; // optional header check
+const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || ''; // optional shared secret
 const PORT          = process.env.PORT || 3000;
 
 function nowTsSec(){ return Math.floor(Date.now()/1000).toString(); }
 function toProductSymbol(sym){
   if(!sym) return sym;
-  let s = String(sym).replace('.P','');
-  if(s.includes(':')) s = s.split(':').pop();
+  let s = String(sym).replace('.P','');           // TV → Exchange (e.g., CAKEUSD.P -> CAKEUSD)
+  if(s.includes(':')) s = s.split(':').pop();     // strip BINANCE: prefix if present
   return s;
 }
 
-// ---------- Delta request helper (hardened with retries/backoff) ----------
+/* ----------------------- Delta request helper ----------------------- */
+// Signs per: method + timestamp + path + query + body
 async function dcall(method, path, payload=null, query='') {
   const body = payload ? JSON.stringify(payload) : '';
   const MAX_TRIES = 3;
@@ -50,14 +55,18 @@ async function dcall(method, path, payload=null, query='') {
     const signature = crypto.createHmac('sha256', API_SECRET).update(prehash).digest('hex');
     const url  = BASE_URL + path + (query||'');
     const headers = {
-      'Content-Type':'application/json','Accept':'application/json',
-      'api-key':API_KEY,'signature':signature,'timestamp':ts,'User-Agent':'tv-relay-node'
+      'Content-Type':'application/json',
+      'Accept':'application/json',
+      'api-key':API_KEY,
+      'signature':signature,
+      'timestamp':ts,
+      'User-Agent':'tv-relay-node'
     };
 
     try {
       const res  = await fetch(url,{ method, headers, body: body || undefined });
-      const text = await res.text(); let json;
-      try { json = JSON.parse(text); } catch { json = { raw: text }; }
+      const text = await res.text();
+      let json; try { json = JSON.parse(text); } catch { json = { raw: text }; }
 
       if (!res.ok || json?.success === false) {
         const code = json?.error?.code || res.status;
@@ -75,7 +84,7 @@ async function dcall(method, path, payload=null, query='') {
   }
 }
 
-// ---------- order helpers ----------
+/* -------------------------- order helpers --------------------------- */
 async function placeEntry(m){
   const side = (m.side||'').toLowerCase()==='buy' ? 'buy' : 'sell';
   const qty  = parseInt(m.qty,10);
@@ -83,23 +92,26 @@ async function placeEntry(m){
   return dcall('POST','/v2/orders',{
     product_symbol: toProductSymbol(m.symbol || m.product_symbol),
     order_type:'market_order',
-    side, size: qty
+    side,
+    size: qty
   });
 }
+
 async function placeBracket(m){
   const {action, ...body} = m;
   if(!body.product_symbol && !body.product_id) body.product_symbol = toProductSymbol(m.product_symbol || m.symbol);
   return dcall('POST','/v2/orders/bracket', body);
 }
+
 async function placeBatch(m){
   const {action, ...body} = m;
   if(!body.product_symbol && !body.product_id) body.product_symbol = toProductSymbol(m.product_symbol || m.symbol);
   return dcall('POST','/v2/orders/batch', body);
 }
 
-// ---------- CANCEL/CLOSE + listings (robust) ----------
-const cancelAllOrders   = () => dcall('DELETE','/v2/orders/all');            // no body on DELETE
-const closeAllPositions = () => dcall('POST','/v2/positions/close_all', {});  // explicit {}
+/* --------------- list / cancel (regular + stop orders) -------------- */
+const cancelAllOrders   = () => dcall('DELETE','/v2/orders/all');                 // regular
+const closeAllPositions = () => dcall('POST','/v2/positions/close_all', {});      // flatten
 
 async function listOpenOrdersAllPages(){
   let all = [];
@@ -116,6 +128,7 @@ async function listOpenOrdersAllPages(){
   }
   return all;
 }
+
 async function listPositionsArray(){
   const pos = await dcall('GET','/v2/positions');
   const arr = Array.isArray(pos?.result?.positions) ? pos.result.positions
@@ -125,36 +138,79 @@ async function listPositionsArray(){
   return arr;
 }
 
-async function waitUntilFlat(timeoutMs = Number(process.env.FLAT_TIMEOUT_MS||15000), pollMs = 400) {
+// ---- STOP ORDERS (triggers) ----
+async function listOpenStopOrdersAllPages() {
+  let all = [];
+  let page = 1;
+  while (true) {
+    const q = `?states=untriggered,triggered&page=${page}&per_page=200`;
+    const so = await dcall('GET', '/v2/stop_orders', null, q);
+    const arr = Array.isArray(so?.result) ? so.result
+              : Array.isArray(so?.stop_orders) ? so.stop_orders
+              : Array.isArray(so) ? so : [];
+    all = all.concat(arr);
+    if (arr.length < 200) break;
+    page++;
+  }
+  return all;
+}
+
+// Try DELETE first; if API expects POST, fall back
+async function cancelAllStopOrders() {
+  try {
+    return await dcall('DELETE', '/v2/stop_orders/all');
+  } catch (e) {
+    return dcall('POST', '/v2/stop_orders/cancel_all', {});
+  }
+}
+
+// Cancel BOTH regular & stop orders
+async function cancelAllOrdersBoth() {
+  const out = { regular: null, stops: null };
+  try { out.regular = await cancelAllOrders(); } catch (e) { out.regular = { error: String(e.message || e) }; }
+  try { out.stops   = await cancelAllStopOrders(); } catch (e) { out.stops   = { error: String(e.message || e) }; }
+  return out;
+}
+
+/* ----------------------- flat gate (robust) ------------------------- */
+async function waitUntilFlat(timeoutMs = Number(process.env.FLAT_TIMEOUT_MS || 15000), pollMs = 400) {
   const end = Date.now() + timeoutMs;
   while (Date.now() < end) {
     try {
-      const oo  = await listOpenOrdersAllPages();
-      const hasOrders = oo.some(o => ['open','pending','triggered','untriggered']
-        .includes(String(o?.state||o?.status||'').toLowerCase()));
+      const [oo, so, pos] = await Promise.all([
+        listOpenOrdersAllPages(),
+        listOpenStopOrdersAllPages(),
+        listPositionsArray()
+      ]);
 
-      const pos = await listPositionsArray();
-      const hasPos = pos.some(p => Math.abs(Number(p?.size||p?.position_size||0)) > 0);
+      const hasOrders = oo.some(o =>
+        ['open','pending'].includes(String(o?.state || o?.status || '').toLowerCase())
+      );
+      const hasStops  = so.some(s =>
+        ['untriggered','triggered','pending'].includes(String(s?.state || s?.status || '').toLowerCase())
+      );
+      const hasPos    = pos.some(p => Math.abs(Number(p?.size || p?.position_size || 0)) > 0);
 
-      if (!hasOrders && !hasPos) return true;
+      if (!hasOrders && !hasStops && !hasPos) return true;
 
       console.log('…still flattening', {
         openOrders: oo.length,
-        positions: pos.map(p=>({ product_id:p.product_id, size:p.size }))
+        stopOrders: so.length,
+        positions : pos.map(p => ({ product_id: p.product_id, symbol: p.product_symbol || p.product_id, size: p.size }))
       });
-    } catch(e) {
-      console.warn('waitUntilFlat poll error (ignoring):', e?.message || e);
+    } catch (e) {
+      console.warn('waitUntilFlat poll error (ignored):', e?.message || e);
     }
     await new Promise(r => setTimeout(r, pollMs));
   }
   return false;
 }
 
-// ---------- health ----------
+/* ------------------------------ health ------------------------------ */
 app.get('/health', (_req,res)=>res.json({ok:true}));
 app.get('/healthz', (_req,res)=>res.send('ok'));
 
-// ---------- TradingView webhook ----------
+/* --------------------------- webhook route -------------------------- */
 app.post('/tv', async (req, res) => {
   try {
     if (WEBHOOK_TOKEN) {
@@ -166,39 +222,39 @@ app.post('/tv', async (req, res) => {
     const action = String(msg.action || '').toUpperCase();
     console.log('\n=== INCOMING /tv ===\n', JSON.stringify(msg));
 
-    // 0) Explicit cleanup from Pine
+    // Manual cleanup from Pine
     if (action === 'DELTA_CANCEL_ALL' || action === 'CANCEL_ALL') {
-      const out = await cancelAllOrders();
-      return res.json({ ok:true, did:'cancel_all_orders', delta: out });
+      const out = await cancelAllOrdersBoth();
+      return res.json({ ok:true, did:'cancel_all_orders_and_stops', delta: out });
     }
     if (action === 'CLOSE_POSITION') {
       const out = await closeAllPositions();
       return res.json({ ok:true, did:'close_all_positions', delta: out });
     }
 
-    // 1) Bracket JSON passthrough (if you send from Pine)
+    // Direct bracket passthrough (if your Pine sends a bracket payload)
     if (msg.stop_loss_order || msg.take_profit_order) {
       const r = await placeBracket(msg);
       return res.json({ ok:true, step:'bracket', r });
     }
 
-    // 2) Batch limits passthrough
+    // Batch limits passthrough (array of orders)
     if (msg.orders) {
       const r = await placeBatch(msg);
       return res.json({ ok:true, step:'batch', r });
     }
 
-    // 3) ENTER / FLIP: force cancel + close, then gate until flat
+    // ENTER / FLIP: clean slate first, then gate until flat, then place entry
     if (action === 'ENTER' || action === 'FLIP') {
-      try { await cancelAllOrders(); } catch(e) { console.warn('cancelAllOrders failed:', e?.message||e); }
-      try { await closeAllPositions(); } catch(e) { console.warn('closeAllPositions failed:', e?.message||e); }
+      try { await cancelAllOrdersBoth(); } catch(e) { console.warn('cancelAllOrdersBoth failed:', e?.message || e); }
+      try { await closeAllPositions();   } catch(e) { console.warn('closeAllPositions failed:', e?.message || e); }
 
-      const flat = await waitUntilFlat(); // 15s default (env FLAT_TIMEOUT_MS)
+      const flat = await waitUntilFlat();
       console.log('flat gate result:', flat);
-      // fall through to placement even if false (belt & suspenders)
+      // proceed regardless — but gate prevents most races
     }
 
-    // 4) Plain market entry (symbol/side/qty required)
+    // Plain market entry (expects {symbol or product_symbol, side, qty})
     const r = await placeEntry(msg);
     return res.json({ ok:true, step:'entry', r });
 
@@ -208,4 +264,5 @@ app.post('/tv', async (req, res) => {
   }
 });
 
-app.listen(PORT, ()=>console.log(`Relay listening http://localhost:${PORT} (BASE=${BASE_URL})`));
+/* ------------------------------ start ------------------------------- */
+app.listen(PORT, ()=>console.log(`Relay listening on http://localhost:${PORT}  (BASE=${BASE_URL})`));
