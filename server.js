@@ -4,7 +4,23 @@ const express = require('express');
 const crypto  = require('crypto');
 const fetch   = global.fetch; // Node 18+
 
+// -------------------- utils --------------------
+function underlyingFromSymbol(sym) {
+  // Accepts "DELTAIN:BTCUSDT" or "BTCUSDT" and returns "BTC"
+  const core = (sym || '').split(':').pop();   // "BTCUSDT"
+  return core.replace(/USDT.*$/,'').replace(/USD.*$/,'');
+}
+function nowTsSec(){ return Math.floor(Date.now()/1000).toString(); }
+function toProductSymbol(sym){
+  if(!sym) return sym;
+  let s = String(sym).replace('.P','');
+  if(s.includes(':')) s = s.split(':').pop();
+  return s;
+}
+
+// -------------------- app --------------------
 const app = express();
+process.env.__STARTED_AT = new Date().toISOString();
 
 // ---------- parsing ----------
 app.use(express.json({ type: '*/*' }));
@@ -25,34 +41,70 @@ app.use((req, _res, next) => {
 });
 
 // ---------- env ----------
-const API_KEY       = process.env.DELTA_API_KEY;
-const API_SECRET    = process.env.DELTA_API_SECRET;
+const API_KEY       = process.env.DELTA_API_KEY || '';
+const API_SECRET    = process.env.DELTA_API_SECRET || '';
 const BASE_URL      = (process.env.DELTA_BASE || process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange').replace(/\/+$/,'');
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || ''; // optional header check
 const PORT          = process.env.PORT || 3000;
 
-function nowTsSec(){ return Math.floor(Date.now()/1000).toString(); }
-function toProductSymbol(sym){
-  if(!sym) return sym;
-  let s = String(sym).replace('.P','');
-  if(s.includes(':')) s = s.split(':').pop();
-  return s;
+// Auth mode + customizable header names
+const AUTH_MODE     = (process.env.DELTA_AUTH || 'hmac').toLowerCase(); // 'hmac' | 'keyonly'
+const HDR_API_KEY   = process.env.DELTA_HDR_API_KEY || 'api-key';
+const HDR_SIG       = process.env.DELTA_HDR_SIG     || 'signature';
+const HDR_TS        = process.env.DELTA_HDR_TS      || 'timestamp';
+
+// ---------- idempotency (drops dupes ~60s) ----------
+const SEEN = new Map();              // key -> ts(ms)
+const SEEN_TTL_MS = 60_000;
+function seenKey(msg){
+  // Make a stable key from the important fields (include Pine's sig_id if present)
+  const p = [
+    String(msg.action||''),
+    String(msg.product_symbol||msg.symbol||''),
+    String(msg.side||''),
+    String(msg.qty||''),
+    String(msg.entry||''),
+    String(msg.strategy_id||''),
+    String(msg.sig_id||'')
+  ].join('|');
+  return crypto.createHash('sha1').update(p).digest('hex');
+}
+function remember(k){
+  SEEN.set(k, Date.now());
+  // prune old + keep map bounded
+  for (const [kk, ts] of SEEN) {
+    if (Date.now()-ts > SEEN_TTL_MS) SEEN.delete(kk);
+  }
+  if (SEEN.size > 300) {
+    // drop oldest few
+    for (const kk of SEEN.keys()) { SEEN.delete(kk); if (SEEN.size <= 200) break; }
+  }
 }
 
-// ---------- Delta request helper (hardened with retries/backoff) ----------
+// ---------- Delta request helper (retries/backoff) ----------
 async function dcall(method, path, payload=null, query='') {
   const body = payload ? JSON.stringify(payload) : '';
   const MAX_TRIES = 3;
 
   for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
     const ts   = nowTsSec();
-    const prehash = method + ts + path + (query||'') + body;
-    const signature = crypto.createHmac('sha256', API_SECRET).update(prehash).digest('hex');
     const url  = BASE_URL + path + (query||'');
     const headers = {
-      'Content-Type':'application/json','Accept':'application/json',
-      'api-key':API_KEY,'signature':signature,'timestamp':ts,'User-Agent':'tv-relay-node'
+      'Content-Type':'application/json',
+      'Accept':'application/json',
+      'User-Agent':'tv-relay-node'
     };
+
+    // Auth: HMAC (default) or key-only
+    if (AUTH_MODE === 'hmac') {
+      const prehash = method + ts + path + (query||'') + body;
+      const signature = crypto.createHmac('sha256', API_SECRET).update(prehash).digest('hex');
+      headers[HDR_API_KEY] = API_KEY;
+      headers[HDR_SIG]     = signature;
+      headers[HDR_TS]      = ts;
+    } else {
+      headers[HDR_API_KEY] = API_KEY;
+    }
 
     try {
       const res  = await fetch(url,{ method, headers, body: body || undefined });
@@ -61,7 +113,8 @@ async function dcall(method, path, payload=null, query='') {
 
       if (!res.ok || json?.success === false) {
         const code = json?.error?.code || res.status;
-        if ([429,500,502,503,504].includes(code) && attempt < MAX_TRIES) {
+        // retry on transient errors
+        if ([429,500,502,503,504].includes(Number(code)) && attempt < MAX_TRIES) {
           await new Promise(r=>setTimeout(r, 300*attempt));
           continue;
         }
@@ -97,9 +150,9 @@ async function placeBatch(m){
   return dcall('POST','/v2/orders/batch', body);
 }
 
-// ---------- CANCEL/CLOSE + listings (robust) ----------
-const cancelAllOrders   = () => dcall('DELETE','/v2/orders/all');            // no body on DELETE
-const closeAllPositions = () => dcall('POST','/v2/positions/close_all', {});  // explicit {}
+// ---------- CANCEL/CLOSE + listings ----------
+const cancelAllOrders   = () => dcall('DELETE','/v2/orders/all');                 // no body on DELETE
+const closeAllPositions = () => dcall('POST','/v2/positions/close_all', {});       // explicit {}
 
 async function listOpenOrdersAllPages(){
   let all = [];
@@ -151,8 +204,11 @@ async function waitUntilFlat(timeoutMs = Number(process.env.FLAT_TIMEOUT_MS||150
 }
 
 // ---------- health ----------
-app.get('/health', (_req,res)=>res.json({ok:true}));
+app.get('/health', (_req,res)=>res.json({ok:true, started_at:process.env.__STARTED_AT}));
 app.get('/healthz', (_req,res)=>res.send('ok'));
+app.get('/debug/seen', (_req,res)=>{
+  res.json({ size: SEEN.size });
+});
 
 // ---------- TradingView webhook ----------
 app.post('/tv', async (req, res) => {
@@ -166,6 +222,18 @@ app.post('/tv', async (req, res) => {
     const action = String(msg.action || '').toUpperCase();
     console.log('\n=== INCOMING /tv ===\n', JSON.stringify(msg));
 
+    // ---- idempotency guard (drop duplicates for ~60s) ----
+    const key = seenKey(msg);
+    if (SEEN.has(key)) {
+      return res.json({ ok:true, dedup:true });
+    }
+    remember(key);
+
+    // ---- Ignore pure EXIT/info at the relay (they're chart logs) ----
+    if (action === 'EXIT') {
+      return res.json({ ok:true, ignored:'EXIT' });
+    }
+
     // 0) Explicit cleanup from Pine
     if (action === 'DELTA_CANCEL_ALL' || action === 'CANCEL_ALL') {
       const out = await cancelAllOrders();
@@ -176,19 +244,19 @@ app.post('/tv', async (req, res) => {
       return res.json({ ok:true, did:'close_all_positions', delta: out });
     }
 
-    // 1) Bracket JSON passthrough (if you send from Pine)
+    // 1) Bracket passthrough (SL/TP container from Pine)
     if (msg.stop_loss_order || msg.take_profit_order) {
       const r = await placeBracket(msg);
       return res.json({ ok:true, step:'bracket', r });
     }
 
-    // 2) Batch limits passthrough
+    // 2) Batch limits passthrough (TPs from Pine)
     if (msg.orders) {
       const r = await placeBatch(msg);
       return res.json({ ok:true, step:'batch', r });
     }
 
-    // 3) ENTER / FLIP: force cancel + close, then gate until flat
+    // 3) ENTER / FLIP: cancel orders + close positions, then gate until flat
     if (action === 'ENTER' || action === 'FLIP') {
       try { await cancelAllOrders(); } catch(e) { console.warn('cancelAllOrders failed:', e?.message||e); }
       try { await closeAllPositions(); } catch(e) { console.warn('closeAllPositions failed:', e?.message||e); }
@@ -198,7 +266,7 @@ app.post('/tv', async (req, res) => {
       // fall through to placement even if false (belt & suspenders)
     }
 
-    // 4) Plain market entry (symbol/side/qty required)
+    // 4) Market entry (symbol/side/qty required)
     const r = await placeEntry(msg);
     return res.json({ ok:true, step:'entry', r });
 
@@ -208,4 +276,4 @@ app.post('/tv', async (req, res) => {
   }
 });
 
-app.listen(PORT, ()=>console.log(`Relay listening http://localhost:${PORT} (BASE=${BASE_URL})`));
+app.listen(PORT, ()=>console.log(`Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE})`));
