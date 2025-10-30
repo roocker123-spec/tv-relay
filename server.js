@@ -1,270 +1,220 @@
-// server.js — Delta Ladder Gateway (ESM)
+// server.js
+require('dotenv').config();
+const express = require('express');
+const crypto  = require('crypto');
+const fetch   = global.fetch; // Node 18+
 
-// 0) Env & imports
-import 'dotenv/config.js';
-import express from 'express';
-import axios from 'axios';
-import pino from 'pino';
-import pinoHttp from 'pino-http';
 
-// ---------- Config ----------
-const PORT = Number(process.env.PORT ?? 3000);
+function underlyingFromSymbol(sym) {
+  // Accepts "DELTAIN:BTCUSDT" or "BTCUSDT" and returns "BTC"
+  const core = (sym || '').split(':').pop();   // "BTCUSDT"
+  return core.replace(/USDT.*$/,'')
+             .replace(/USD.*$/,'');            // BTC, ETH, etc.
+}
 
-// If you don’t have correct signing yet, keep MOCK=true (no real API calls)
-const MOCK = (process.env.MOCK ?? 'true').toLowerCase() === 'true';
 
-// IMPORTANT: use the exact var name from your .env
-// Example for Delta India: https://api.india.delta.exchange
-const DELTA_BASE_URL =
-  process.env.DELTA_BASE ||
-  process.env.DELTA_BASE_URL ||
-  'https://api.delta.exchange';
-
-const DELTA_KEY    = process.env.DELTA_API_KEY ?? '';
-const DELTA_SECRET = process.env.DELTA_API_SECRET ?? '';
-const DELTA_PPH    = process.env.DELTA_API_PASSPHRASE ?? '';
-
-// --- ENTER barrier knobs
-const FLAT_TIMEOUT_MS  = 20_000;   // total wait for flatness
-const FLAT_INTERVAL_MS = 700;      // poll cadence
-const SIZE_EPS         = 1e-8;     // treat <= this as flat
-
-// ---------- Logger ----------
-const log = pino({ level: process.env.LOG_LEVEL ?? 'info' });
-const httpLogger = pinoHttp({ logger: log });
-
-// ---------- Express ----------
 const app = express();
-app.use(express.json({ limit: '256kb' }));
-app.use(httpLogger);
-
-// ---------- Axios (Delta client) ----------
-const delta = axios.create({
-  baseURL: DELTA_BASE_URL,
-  timeout: 15_000,
+process.env.__STARTED_AT = new Date().toISOString();
+// ---------- parsing ----------
+app.use(express.json({ type: '*/*' }));
+app.use(express.urlencoded({ extended: true }));
+app.use((req, _res, next) => {
+  if (typeof req.body === 'string') {
+    try { req.body = JSON.parse(req.body); }
+    catch {
+      const qs = require('querystring');
+      req.body = qs.parse(req.body);
+    }
+  }
+  if (req.body && typeof req.body.qty !== 'undefined') {
+    const q = parseInt(req.body.qty, 10);
+    if (!Number.isNaN(q)) req.body.qty = q;
+  }
+  next();
 });
 
-// TODO (LIVE): add the real HMAC signing per Delta docs here.
-// Leaving a placeholder so you can drop your working signer.
-delta.interceptors.request.use((cfg) => {
-  if (MOCK) return cfg;
+// ---------- env ----------
+const API_KEY       = process.env.DELTA_API_KEY;
+const API_SECRET    = process.env.DELTA_API_SECRET;
+const BASE_URL      = (process.env.DELTA_BASE || process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange').replace(/\/+$/,'');
+const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || ''; // optional header check
+const PORT          = process.env.PORT || 3000;
 
-  // Example sketch — REPLACE with your proven signing:
-  // const ts = String(Math.floor(Date.now() / 1000));
-  // const prehash = ts + cfg.method.toUpperCase() + cfg.url + (cfg.data ? JSON.stringify(cfg.data) : '');
-  // const sig = crypto.createHmac('sha256', DELTA_SECRET).update(prehash).digest('hex');
-  // cfg.headers['api-key'] = DELTA_KEY;
-  // cfg.headers['timestamp'] = ts;
-  // cfg.headers['signature'] = sig;
-  // if (DELTA_PPH) cfg.headers['passphrase'] = DELTA_PPH;
+function nowTsSec(){ return Math.floor(Date.now()/1000).toString(); }
+function toProductSymbol(sym){
+  if(!sym) return sym;
+  let s = String(sym).replace('.P','');
+  if(s.includes(':')) s = s.split(':').pop();
+  return s;
+}
 
-  return cfg;
-});
+// ---------- Delta request helper (hardened with retries/backoff) ----------
+async function dcall(method, path, payload=null, query='') {
+  const body = payload ? JSON.stringify(payload) : '';
+  const MAX_TRIES = 3;
 
-// ---------- Utils ----------
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const nowISO = () => new Date().toISOString();
+  for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+    const ts   = nowTsSec();
+    const prehash = method + ts + path + (query||'') + body;
+    const signature = crypto.createHmac('sha256', API_SECRET).update(prehash).digest('hex');
+    const url  = BASE_URL + path + (query||'');
+    const headers = {
+      'Content-Type':'application/json','Accept':'application/json',
+      'api-key':API_KEY,'signature':signature,'timestamp':ts,'User-Agent':'tv-relay-node'
+    };
 
-// =====================================================================
-// 1) Readers used by the barrier (fill with real endpoints when LIVE)
-// =====================================================================
-async function deltaListOpenOrders({ product_symbol, strategy_id }) {
-  if (MOCK) return [];
-  // Replace with your actually working “list open orders” endpoint:
-  // e.g. GET /v2/orders?status=open&product_symbol=...&strategy_id=...
-  const { data } = await delta.get('/v2/orders', {
-    params: { status: 'open', product_symbol, ...(strategy_id ? { strategy_id } : {}) },
+    try {
+      const res  = await fetch(url,{ method, headers, body: body || undefined });
+      const text = await res.text(); let json;
+      try { json = JSON.parse(text); } catch { json = { raw: text }; }
+
+      if (!res.ok || json?.success === false) {
+        const code = json?.error?.code || res.status;
+        if ([429,500,502,503,504].includes(code) && attempt < MAX_TRIES) {
+          await new Promise(r=>setTimeout(r, 300*attempt));
+          continue;
+        }
+        throw new Error(`Delta API error: ${JSON.stringify({ url, status: res.status, json })}`);
+      }
+      return json;
+    } catch (e) {
+      if (attempt === MAX_TRIES) throw e;
+      await new Promise(r=>setTimeout(r, 300*attempt));
+    }
+  }
+}
+
+// ---------- order helpers ----------
+async function placeEntry(m){
+  const side = (m.side||'').toLowerCase()==='buy' ? 'buy' : 'sell';
+  const qty  = parseInt(m.qty,10);
+  if(!qty || qty < 1) throw new Error('qty must be integer >= 1');
+  return dcall('POST','/v2/orders',{
+    product_symbol: toProductSymbol(m.symbol || m.product_symbol),
+    order_type:'market_order',
+    side, size: qty
   });
-  return Array.isArray(data?.orders) ? data.orders : [];
+}
+async function placeBracket(m){
+  const {action, ...body} = m;
+  if(!body.product_symbol && !body.product_id) body.product_symbol = toProductSymbol(m.product_symbol || m.symbol);
+  return dcall('POST','/v2/orders/bracket', body);
+}
+async function placeBatch(m){
+  const {action, ...body} = m;
+  if(!body.product_symbol && !body.product_id) body.product_symbol = toProductSymbol(m.product_symbol || m.symbol);
+  return dcall('POST','/v2/orders/batch', body);
 }
 
-async function deltaGetPosition({ product_symbol }) {
-  if (MOCK) return { size: 0 };
-  // Replace with your actually working “positions” endpoint:
-  // e.g. GET /v2/positions?product_symbol=...
-  const { data } = await delta.get('/v2/positions', { params: { product_symbol } });
-  const arr = Array.isArray(data?.positions) ? data.positions : [];
-  const pos = arr.find(p => p.product_symbol === product_symbol);
-  const n = Number(pos?.size ?? 0);
-  return { size: isFinite(n) ? n : 0 };
-}
+// ---------- CANCEL/CLOSE + listings (robust) ----------
+const cancelAllOrders   = () => dcall('DELETE','/v2/orders/all');            // no body on DELETE
+const closeAllPositions = () => dcall('POST','/v2/positions/close_all', {});  // explicit {}
 
-// =====================================================================
-// 2) Writers — calls you use from Pine / PowerShell
-// =====================================================================
-async function deltaCancelAll({ product_symbol }) {
-  if (MOCK) {
-    log.info({ product_symbol }, 'MOCK: CANCEL_ALL');
-    return { ok: true, mock: true };
+async function listOpenOrdersAllPages(){
+  let all = [];
+  let page = 1;
+  while (true){
+    const q = `?states=open,pending&page=${page}&per_page=200`;
+    const oo = await dcall('GET','/v2/orders', null, q);
+    const arr = Array.isArray(oo?.result) ? oo.result
+              : Array.isArray(oo?.orders) ? oo.orders
+              : Array.isArray(oo) ? oo : [];
+    all = all.concat(arr);
+    if (arr.length < 200) break;
+    page++;
   }
-  // Replace with your working one (401/404 means the path/auth is wrong)
-  const { data } = await delta.post('/v2/orders/cancel_all', { product_symbol });
-  return data ?? { ok: true };
+  return all;
+}
+async function listPositionsArray(){
+  const pos = await dcall('GET','/v2/positions');
+  const arr = Array.isArray(pos?.result?.positions) ? pos.result.positions
+            : Array.isArray(pos?.result) ? pos.result
+            : Array.isArray(pos?.positions) ? pos.positions
+            : Array.isArray(pos) ? pos : [];
+  return arr;
 }
 
-async function deltaClosePosition({ product_symbol, side, strategy_id }) {
-  if (MOCK) {
-    log.info({ product_symbol, side, strategy_id }, 'MOCK: CLOSE_POSITION');
-    return { ok: true, mock: true };
-  }
-  // Typical shape: market reduce-only opposite side
-  const payload = {
-    product_symbol,
-    order_type: 'market_order',
-    side,                 // "buy" or "sell" — opposite of the open position
-    size: 'close',        // or the current abs(size)
-    reduce_only: true,
-    time_in_force: 'ioc',
-    ...(strategy_id ? { strategy_id } : {}),
-  };
-  const { data } = await delta.post('/v2/orders', payload);
-  return data ?? { ok: true };
-}
+async function waitUntilFlat(timeoutMs = Number(process.env.FLAT_TIMEOUT_MS||15000), pollMs = 400) {
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    try {
+      const oo  = await listOpenOrdersAllPages();
+      const hasOrders = oo.some(o => ['open','pending','triggered','untriggered']
+        .includes(String(o?.state||o?.status||'').toLowerCase()));
 
-async function deltaEnterMarket({ product_symbol, side, qty, strategy_id }) {
-  if (MOCK) {
-    log.info({ product_symbol, side, qty, strategy_id }, 'MOCK: ENTER MARKET');
-    return { ok: true, mock: true };
-  }
-  const payload = {
-    product_symbol,
-    order_type: 'market_order',
-    side,                      // "buy" | "sell"
-    size: Number(qty),
-    reduce_only: false,
-    time_in_force: 'ioc',
-    ...(strategy_id ? { strategy_id } : {}),
-  };
-  const { data } = await delta.post('/v2/orders', payload);
-  return data ?? { ok: true };
-}
+      const pos = await listPositionsArray();
+      const hasPos = pos.some(p => Math.abs(Number(p?.size||p?.position_size||0)) > 0);
 
-// =====================================================================
-// 3) Flat barrier (cancel + close + wait) — before ENTER/FLIP
-// =====================================================================
-async function waitUntilFlat({ product_symbol, strategy_id },
-  { timeoutMs = FLAT_TIMEOUT_MS, intervalMs = FLAT_INTERVAL_MS } = {}) {
-  const t0 = Date.now();
-  while (Date.now() - t0 < timeoutMs) {
-    const [orders, pos] = await Promise.all([
-      deltaListOpenOrders({ product_symbol, strategy_id }).catch(() => []),
-      deltaGetPosition({ product_symbol }).catch(() => ({ size: 0 })),
-    ]);
-    const noOrders = !orders || orders.length === 0;
-    const flatPos = !pos || Math.abs(Number(pos.size) || 0) <= SIZE_EPS;
-    if (noOrders && flatPos) return true;
-    await sleep(intervalMs);
+      if (!hasOrders && !hasPos) return true;
+
+      console.log('…still flattening', {
+        openOrders: oo.length,
+        positions: pos.map(p=>({ product_id:p.product_id, size:p.size }))
+      });
+    } catch(e) {
+      console.warn('waitUntilFlat poll error (ignoring):', e?.message || e);
+    }
+    await new Promise(r => setTimeout(r, pollMs));
   }
   return false;
 }
 
-async function ensureFlatThenEnter(msg, logger = log) {
-  await deltaCancelAll({ product_symbol: msg.product_symbol }).catch(e =>
-    logger.warn({ err: e?.message }, 'cancel_all failed (continuing)')
-  );
-  await deltaClosePosition({
-    product_symbol: msg.product_symbol,
-    side: msg.side === 'buy' ? 'sell' : 'buy',
-    strategy_id: msg.strategy_id,
-  }).catch(e => logger.warn({ err: e?.message }, 'close_position failed (continuing)'));
+// ---------- health ----------
+app.get('/health', (_req,res)=>res.json({ok:true}));
+app.get('/healthz', (_req,res)=>res.send('ok'));
 
-  logger.info({ ps: msg.product_symbol, sid: msg.strategy_id }, 'waiting to become FLAT…');
-  const ok = await waitUntilFlat(
-    { product_symbol: msg.product_symbol, strategy_id: msg.strategy_id },
-    { timeoutMs: FLAT_TIMEOUT_MS, intervalMs: FLAT_INTERVAL_MS }
-  );
-  if (!ok) {
-    const err = { ok: false, error: 'Timeout: still not flat; entry aborted' };
-    logger.error(err);
-    return err;
+// ---------- TradingView webhook ----------
+app.post('/tv', async (req, res) => {
+  try {
+    if (WEBHOOK_TOKEN) {
+      const hdr = req.headers['x-webhook-token'];
+      if (hdr !== WEBHOOK_TOKEN) return res.status(401).json({ ok:false, error:'unauthorized' });
+    }
+
+    const msg    = (typeof req.body === 'string') ? JSON.parse(req.body) : (req.body || {});
+    const action = String(msg.action || '').toUpperCase();
+    console.log('\n=== INCOMING /tv ===\n', JSON.stringify(msg));
+
+    // 0) Explicit cleanup from Pine
+    if (action === 'DELTA_CANCEL_ALL' || action === 'CANCEL_ALL') {
+      const out = await cancelAllOrders();
+      return res.json({ ok:true, did:'cancel_all_orders', delta: out });
+    }
+    if (action === 'CLOSE_POSITION') {
+      const out = await closeAllPositions();
+      return res.json({ ok:true, did:'close_all_positions', delta: out });
+    }
+
+    // 1) Bracket JSON passthrough (if you send from Pine)
+    if (msg.stop_loss_order || msg.take_profit_order) {
+      const r = await placeBracket(msg);
+      return res.json({ ok:true, step:'bracket', r });
+    }
+
+    // 2) Batch limits passthrough
+    if (msg.orders) {
+      const r = await placeBatch(msg);
+      return res.json({ ok:true, step:'batch', r });
+    }
+
+    // 3) ENTER / FLIP: force cancel + close, then gate until flat
+    if (action === 'ENTER' || action === 'FLIP') {
+      try { await cancelAllOrders(); } catch(e) { console.warn('cancelAllOrders failed:', e?.message||e); }
+      try { await closeAllPositions(); } catch(e) { console.warn('closeAllPositions failed:', e?.message||e); }
+
+      const flat = await waitUntilFlat(); // 15s default (env FLAT_TIMEOUT_MS)
+      console.log('flat gate result:', flat);
+      // fall through to placement even if false (belt & suspenders)
+    }
+
+    // 4) Plain market entry (symbol/side/qty required)
+    const r = await placeEntry(msg);
+    return res.json({ ok:true, step:'entry', r });
+
+  } catch (e) {
+    console.error('✖ ERROR:', e);
+    return res.status(400).json({ ok:false, error:String(e.message || e) });
   }
-  return deltaEnterMarket({
-    product_symbol: msg.product_symbol,
-    side: msg.side,
-    qty: msg.qty ?? msg.size,
-    strategy_id: msg.strategy_id,
-  });
-}
-
-// =====================================================================
-// 4) Simple serial queue so /tv requests don’t overlap
-// =====================================================================
-let _serial = Promise.resolve();
-function runSerial(fn) {
-  _serial = _serial.then(fn, fn).catch(e => log.error(e));
-  return _serial;
-}
-
-// =====================================================================
-// 5) Endpoints — /tv (your working format) + /webhook (alias)
-// =====================================================================
-app.get('/health', (req, res) => {
-  res.json({
-    ok: true,
-    ts: nowISO(),
-    mock: MOCK,
-    port: PORT,
-    delta_base_url: DELTA_BASE_URL,
-    has_keys: Boolean(DELTA_KEY && DELTA_SECRET),
-  });
 });
 
-function handleMsg(msg) {
-  const a = String(msg.action ?? '').toUpperCase();
-  log.info({ a, msg }, 'TV/Webhook received');
-
-  switch (a) {
-    case 'DELTA_CANCEL_ALL':
-    case 'CANCEL_ALL':
-      return deltaCancelAll({ product_symbol: msg.product_symbol });
-
-    case 'CLOSE_POSITION':
-      return deltaClosePosition({
-        product_symbol: msg.product_symbol,
-        side: msg.side === 'buy' ? 'sell' : 'buy',
-        strategy_id: msg.strategy_id,
-      });
-
-    case 'ENTER':
-    case 'FLIP':
-      return ensureFlatThenEnter(msg, log);
-
-    case 'PANIC':
-      // optional: cancel then close
-      return (async () => {
-        await deltaCancelAll({ product_symbol: msg.product_symbol }).catch(() => {});
-        return deltaClosePosition({
-          product_symbol: msg.product_symbol,
-          side: msg.side === 'buy' ? 'sell' : 'buy',
-          strategy_id: msg.strategy_id,
-        });
-      })();
-
-    default:
-      log.warn({ a }, 'Unknown action; ignoring');
-      return Promise.resolve({ ok: true, ignored: true });
-  }
-}
-
-// Your “working” endpoint
-app.post('/tv', (req, res) => {
-  const msg = req.body || {};
-  res.json({ ok: true, enqueued: true });
-  runSerial(() => handleMsg(msg).catch(e =>
-    log.error({ err: e?.message, stack: e?.stack }, 'Action failed')
-  ));
-});
-
-// Back-compat alias (Pine can still post here)
-app.post('/webhook', (req, res) => {
-  const msg = req.body || {};
-  res.json({ ok: true, enqueued: true });
-  runSerial(() => handleMsg(msg).catch(e =>
-    log.error({ err: e?.message, stack: e?.stack }, 'Action failed')
-  ));
-});
-
-// ---------- Start ----------
-app.listen(PORT, () => {
-  log.info({ msg: `Delta Ladder Gateway listening on :${PORT}` });
-});
+app.listen(PORT, ()=>console.log(`Relay listening http://localhost:${PORT} (BASE=${BASE_URL})`));
