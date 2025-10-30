@@ -4,17 +4,8 @@ const express = require('express');
 const crypto  = require('crypto');
 const fetch   = global.fetch; // Node 18+
 
-
-function underlyingFromSymbol(sym) {
-  // Accepts "DELTAIN:BTCUSDT" or "BTCUSDT" and returns "BTC"
-  const core = (sym || '').split(':').pop();   // "BTCUSDT"
-  return core.replace(/USDT.*$/,'')
-             .replace(/USD.*$/,'');            // BTC, ETH, etc.
-}
-
-
 const app = express();
-process.env.__STARTED_AT = new Date().toISOString();
+
 // ---------- parsing ----------
 app.use(express.json({ type: '*/*' }));
 app.use(express.urlencoded({ extended: true }));
