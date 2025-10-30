@@ -4,25 +4,26 @@ const express = require('express');
 const crypto  = require('crypto');
 const fetch   = global.fetch; // Node 18+
 
-// -------------------- utils --------------------
-function underlyingFromSymbol(sym) {
-  // Accepts "DELTAIN:BTCUSDT" or "BTCUSDT" and returns "BTC"
-  const core = (sym || '').split(':').pop();   // "BTCUSDT"
-  return core.replace(/USDT.*$/,'').replace(/USD.*$/,'');
-}
+// ===================== Utils =====================
 function nowTsSec(){ return Math.floor(Date.now()/1000).toString(); }
-function toProductSymbol(sym){
-  if(!sym) return sym;
-  let s = String(sym).replace('.P','');
-  if(s.includes(':')) s = s.split(':').pop();
-  return s;
+
+// Remove venue prefix like "DELTAIN:" and return the right side
+function stripVenue(sym) {
+  if (!sym) return sym;
+  const s = String(sym);
+  return s.includes(':') ? s.split(':').pop() : s;
 }
 
-// -------------------- app --------------------
+// (legacy helper kept for completeness)
+function underlyingFromSymbol(sym) {
+  const core = stripVenue(sym || '');   // e.g. "BTCUSDT"
+  return core.replace(/USDT.*$/,'').replace(/USD.*$/,''); // "BTC"
+}
+
+// ============ App bootstrap / parsing ============
 const app = express();
 process.env.__STARTED_AT = new Date().toISOString();
 
-// ---------- parsing ----------
 app.use(express.json({ type: '*/*' }));
 app.use(express.urlencoded({ extended: true }));
 app.use((req, _res, next) => {
@@ -40,24 +41,25 @@ app.use((req, _res, next) => {
   next();
 });
 
-// ---------- env ----------
+// ===================== Env / Auth =====================
 const API_KEY       = process.env.DELTA_API_KEY || '';
 const API_SECRET    = process.env.DELTA_API_SECRET || '';
 const BASE_URL      = (process.env.DELTA_BASE || process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange').replace(/\/+$/,'');
-const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || ''; // optional header check
+const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';
 const PORT          = process.env.PORT || 3000;
 
 // Auth mode + customizable header names
-const AUTH_MODE     = (process.env.DELTA_AUTH || 'hmac').toLowerCase(); // 'hmac' | 'keyonly'
-const HDR_API_KEY   = process.env.DELTA_HDR_API_KEY || 'api-key';
-const HDR_SIG       = process.env.DELTA_HDR_SIG     || 'signature';
-const HDR_TS        = process.env.DELTA_HDR_TS      || 'timestamp';
+const AUTH_MODE   = (process.env.DELTA_AUTH || 'hmac').toLowerCase(); // 'hmac' | 'keyonly'
+const HDR_API_KEY = process.env.DELTA_HDR_API_KEY || 'api-key';
+const HDR_SIG     = process.env.DELTA_HDR_SIG     || 'signature';
+const HDR_TS      = process.env.DELTA_HDR_TS      || 'timestamp';
 
-// ---------- idempotency (drops dupes ~60s) ----------
+// ===================== Idempotency =====================
 const SEEN = new Map();              // key -> ts(ms)
 const SEEN_TTL_MS = 60_000;
+
 function seenKey(msg){
-  // Make a stable key from the important fields (include Pine's sig_id if present)
+  // Stable key across retries; include sig_id if Pine sends it
   const p = [
     String(msg.action||''),
     String(msg.product_symbol||msg.symbol||''),
@@ -71,17 +73,17 @@ function seenKey(msg){
 }
 function remember(k){
   SEEN.set(k, Date.now());
-  // prune old + keep map bounded
+  // prune
   for (const [kk, ts] of SEEN) {
     if (Date.now()-ts > SEEN_TTL_MS) SEEN.delete(kk);
   }
+  // cap size
   if (SEEN.size > 300) {
-    // drop oldest few
     for (const kk of SEEN.keys()) { SEEN.delete(kk); if (SEEN.size <= 200) break; }
   }
 }
 
-// ---------- Delta request helper (retries/backoff) ----------
+// ===================== Delta client =====================
 async function dcall(method, path, payload=null, query='') {
   const body = payload ? JSON.stringify(payload) : '';
   const MAX_TRIES = 3;
@@ -112,9 +114,8 @@ async function dcall(method, path, payload=null, query='') {
       try { json = JSON.parse(text); } catch { json = { raw: text }; }
 
       if (!res.ok || json?.success === false) {
-        const code = json?.error?.code || res.status;
-        // retry on transient errors
-        if ([429,500,502,503,504].includes(Number(code)) && attempt < MAX_TRIES) {
+        const code = Number(json?.error?.code || res.status);
+        if ([429,500,502,503,504].includes(code) && attempt < MAX_TRIES) {
           await new Promise(r=>setTimeout(r, 300*attempt));
           continue;
         }
@@ -128,30 +129,64 @@ async function dcall(method, path, payload=null, query='') {
   }
 }
 
-// ---------- order helpers ----------
-async function placeEntry(m){
+// ===================== Order helpers (raw) =====================
+// NOTE: these expect a correct product_symbol in the payload.
+// The "Smart" wrappers below will provide it.
+async function placeEntryRaw(m){
   const side = (m.side||'').toLowerCase()==='buy' ? 'buy' : 'sell';
   const qty  = parseInt(m.qty,10);
   if(!qty || qty < 1) throw new Error('qty must be integer >= 1');
   return dcall('POST','/v2/orders',{
-    product_symbol: toProductSymbol(m.symbol || m.product_symbol),
+    product_symbol: m.product_symbol || m.symbol,
     order_type:'market_order',
     side, size: qty
   });
 }
-async function placeBracket(m){
+async function placeBracketRaw(m){
   const {action, ...body} = m;
-  if(!body.product_symbol && !body.product_id) body.product_symbol = toProductSymbol(m.product_symbol || m.symbol);
+  if(!body.product_symbol && !body.product_id) body.product_symbol = m.product_symbol || m.symbol;
   return dcall('POST','/v2/orders/bracket', body);
 }
-async function placeBatch(m){
+async function placeBatchRaw(m){
   const {action, ...body} = m;
-  if(!body.product_symbol && !body.product_id) body.product_symbol = toProductSymbol(m.product_symbol || m.symbol);
+  if(!body.product_symbol && !body.product_id) body.product_symbol = m.product_symbol || m.symbol;
   return dcall('POST','/v2/orders/batch', body);
 }
 
-// ---------- CANCEL/CLOSE + listings ----------
-const cancelAllOrders   = () => dcall('DELETE','/v2/orders/all');                 // no body on DELETE
+// ===================== Smart product_symbol resolver =====================
+// Tries with and without ".P" while stripping any venue prefix like "DELTAIN:"
+async function resolveAnd(fn, msg, which='entry') {
+  const raw   = stripVenue(msg.product_symbol || msg.symbol || '');
+  if (!raw) throw new Error(`Missing symbol/product_symbol for ${which}`);
+
+  const noDot = raw.endsWith('.P') ? raw.slice(0, -2) : raw;
+  const candidates = raw.endsWith('.P') ? [raw, noDot] : [raw, noDot];
+
+  let lastErr;
+  for (const c of candidates) {
+    const payload = { ...msg, product_symbol: c, symbol: c };
+    try {
+      const out = await fn(payload);
+      console.log(`[OK] ${which} -> ${c}`);
+      return out;
+    } catch (e) {
+      const m = String(e?.message || e);
+      const is4xx = /\b(400|404)\b/.test(m);
+      const prodHint = /product|symbol/i.test(m);
+      if (!(is4xx && prodHint)) throw e; // non-product error: rethrow
+      console.warn(`[retry] ${which} failed for ${c}; trying next candidate`, m);
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error(`Unable to resolve product_symbol for ${which}`);
+}
+
+async function placeEntrySmart  (m){ return resolveAnd(placeEntryRaw,   m, 'entry');   }
+async function placeBracketSmart(m){ return resolveAnd(placeBracketRaw, m, 'bracket'); }
+async function placeBatchSmart  (m){ return resolveAnd(placeBatchRaw,   m, 'batch');   }
+
+// ===================== Cancel/Close/Lists =====================
+const cancelAllOrders   = () => dcall('DELETE','/v2/orders/all');                 // no body
 const closeAllPositions = () => dcall('POST','/v2/positions/close_all', {});       // explicit {}
 
 async function listOpenOrdersAllPages(){
@@ -203,14 +238,12 @@ async function waitUntilFlat(timeoutMs = Number(process.env.FLAT_TIMEOUT_MS||150
   return false;
 }
 
-// ---------- health ----------
-app.get('/health', (_req,res)=>res.json({ok:true, started_at:process.env.__STARTED_AT}));
+// ===================== Health/debug =====================
+app.get('/health', (_req,res)=>res.json({ok:true, started_at:process.env.__STARTED_AT, base:BASE_URL, auth:AUTH_MODE}));
 app.get('/healthz', (_req,res)=>res.send('ok'));
-app.get('/debug/seen', (_req,res)=>{
-  res.json({ size: SEEN.size });
-});
+app.get('/debug/seen', (_req,res)=>res.json({ size: SEEN.size }));
 
-// ---------- TradingView webhook ----------
+// ===================== TradingView webhook =====================
 app.post('/tv', async (req, res) => {
   try {
     if (WEBHOOK_TOKEN) {
@@ -222,19 +255,15 @@ app.post('/tv', async (req, res) => {
     const action = String(msg.action || '').toUpperCase();
     console.log('\n=== INCOMING /tv ===\n', JSON.stringify(msg));
 
-    // ---- idempotency guard (drop duplicates for ~60s) ----
+    // Idempotency: drop duplicates for ~60s
     const key = seenKey(msg);
-    if (SEEN.has(key)) {
-      return res.json({ ok:true, dedup:true });
-    }
+    if (SEEN.has(key)) return res.json({ ok:true, dedup:true });
     remember(key);
 
-    // ---- Ignore pure EXIT/info at the relay (they're chart logs) ----
-    if (action === 'EXIT') {
-      return res.json({ ok:true, ignored:'EXIT' });
-    }
+    // EXIT messages from Pine are informational for the relay; ignore
+    if (action === 'EXIT') return res.json({ ok:true, ignored:'EXIT' });
 
-    // 0) Explicit cleanup from Pine
+    // 0) Explicit cleanup
     if (action === 'DELTA_CANCEL_ALL' || action === 'CANCEL_ALL') {
       const out = await cancelAllOrders();
       return res.json({ ok:true, did:'cancel_all_orders', delta: out });
@@ -246,28 +275,28 @@ app.post('/tv', async (req, res) => {
 
     // 1) Bracket passthrough (SL/TP container from Pine)
     if (msg.stop_loss_order || msg.take_profit_order) {
-      const r = await placeBracket(msg);
+      const r = await placeBracketSmart(msg);
       return res.json({ ok:true, step:'bracket', r });
     }
 
     // 2) Batch limits passthrough (TPs from Pine)
     if (msg.orders) {
-      const r = await placeBatch(msg);
+      const r = await placeBatchSmart(msg);
       return res.json({ ok:true, step:'batch', r });
     }
 
-    // 3) ENTER / FLIP: cancel orders + close positions, then gate until flat
+    // 3) ENTER / FLIP → cancel orders + close positions, then gate until flat
     if (action === 'ENTER' || action === 'FLIP') {
-      try { await cancelAllOrders(); } catch(e) { console.warn('cancelAllOrders failed:', e?.message||e); }
+      try { await cancelAllOrders(); }  catch(e) { console.warn('cancelAllOrders failed:', e?.message||e); }
       try { await closeAllPositions(); } catch(e) { console.warn('closeAllPositions failed:', e?.message||e); }
 
-      const flat = await waitUntilFlat(); // 15s default (env FLAT_TIMEOUT_MS)
+      const flat = await waitUntilFlat(); // 15s default
       console.log('flat gate result:', flat);
-      // fall through to placement even if false (belt & suspenders)
+      // proceed even if false (belt & suspenders)
     }
 
     // 4) Market entry (symbol/side/qty required)
-    const r = await placeEntry(msg);
+    const r = await placeEntrySmart(msg);
     return res.json({ ok:true, step:'entry', r });
 
   } catch (e) {
