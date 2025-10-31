@@ -7,14 +7,14 @@ const fetch   = global.fetch; // Node 18+
 // -------------------- utils --------------------
 function nowTsSec(){ return Math.floor(Date.now()/1000).toString(); }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
-function toProductSymbol(sym){
-  if(!sym) return sym;
-  let s = String(sym).replace('.P','');
-  if(s.includes(':')) s = s.split(':').pop();
-  return s;
-}
 function clamp(n,min,max){ return Math.min(Math.max(n,min),max); }
 function nnum(x, d=0){ const n = Number(x); return Number.isFinite(n) ? n : d; }
+function toProductSymbol(sym){
+  if(!sym) return sym;
+  let s = String(sym).replace('.P',''); // remove TradingView .P suffix if present
+  if(s.includes(':')) s = s.split(':').pop(); // remove prefix like BINANCE:
+  return s;
+}
 
 // -------------------- app --------------------
 const app = express();
@@ -31,7 +31,6 @@ app.use((req, _res, next) => {
       req.body = qs.parse(req.body);
     }
   }
-  // coerce qty if present
   if (req.body && typeof req.body.qty !== 'undefined') {
     const q = parseInt(req.body.qty, 10);
     if (!Number.isNaN(q)) req.body.qty = q;
@@ -51,10 +50,11 @@ const HDR_API_KEY   = process.env.DELTA_HDR_API_KEY || 'api-key';
 const HDR_SIG       = process.env.DELTA_HDR_SIG     || 'signature';
 const HDR_TS        = process.env.DELTA_HDR_TS      || 'timestamp';
 
-// Defaults for amount-based sizing
+// Amount-based sizing defaults
 const DEFAULT_LEVERAGE   = nnum(process.env.DEFAULT_LEVERAGE, 10);
-const FX_INR_FALLBACK    = nnum(process.env.FX_INR_FALLBACK, 85); // ₹ per USD
-const MARGIN_BUFFER_PCT  = nnum(process.env.MARGIN_BUFFER_PCT, 0.03); // 3% slack to avoid insufficient_margin
+const FX_INR_FALLBACK    = nnum(process.env.FX_INR_FALLBACK, 85);  // ₹ per USD
+const MARGIN_BUFFER_PCT  = nnum(process.env.MARGIN_BUFFER_PCT, 0.03); // 3%
+const MAX_LOTS_PER_ORDER = nnum(process.env.MAX_LOTS_PER_ORDER, 200000);
 
 // ---------- idempotency (drops dupes ~60s) ----------
 const SEEN = new Map();              // key -> ts(ms)
@@ -127,7 +127,7 @@ async function dcall(method, path, payload=null, query='') {
   }
 }
 
-// ---------- product + price helpers ----------
+// ---------- product + price helpers (no hardcoding) ----------
 let _products = null, _products_ts = 0;
 async function getProducts(){
   const STALE_MS = 5*60*1000;
@@ -146,28 +146,44 @@ async function getProductMeta(product_symbol){
   const list = await getProducts();
   return list.find(p => String(p?.symbol||p?.product_symbol||'').toUpperCase() === ps);
 }
+
+const LOT_MULT_CACHE = new Map(); // product_symbol -> { m, ts }
+app.get('/debug/lotcache', (_req,res)=>{
+  const o = {}; for (const [k,v] of LOT_MULT_CACHE) o[k]=v;
+  res.json(o);
+});
+
+// Try to infer multiplier from meta fields (robust, no hardcode)
 function lotMultiplierFromMeta(meta){
-  // Delta exposes one of these as "coins per lot" (1 for ADA, 10 for ARC/BLESS)
-  return nnum(meta?.contract_value || meta?.lot_size || meta?.contract_size, 1);
+  const cand = [
+    meta?.contract_value,
+    meta?.contract_size,
+    meta?.lot_size,
+    meta?.contract_unit,
+    meta?.qty_step
+  ].map(n => Number.isFinite(+n) ? +n : NaN).filter(n => n && n > 0);
+
+  const ints = cand.filter(n => Math.abs(n - Math.round(n)) < 1e-6);
+  let m = (ints.length ? Math.max(...ints) : (cand.length ? Math.max(...cand) : 1));
+
+  if (!Number.isFinite(m) || m < 1) m = 1;
+  return Math.round(m);
 }
+function getCachedLotMult(psym){ return LOT_MULT_CACHE.get(psym)?.m || null; }
+function setCachedLotMult(psym, m){ if (m && m >= 1 && m <= 1e9) LOT_MULT_CACHE.set(psym,{m: Math.round(m), ts: Date.now()}); }
+
 async function getTickerPriceUSD(psym){
   try {
     const q = `?symbol=${encodeURIComponent(psym)}`;
     const r = await dcall('GET','/v2/tickers', null, q);
-    const t = (Array.isArray(r?.result) ? r.result : Array.isArray(r) ? r : []).find(x => (x?.symbol||x?.product_symbol)===psym);
+    const arr = Array.isArray(r?.result) ? r.result : Array.isArray(r) ? r : [];
+    const t = arr.find(x => (x?.symbol||x?.product_symbol)===psym);
     const px = nnum(t?.mark_price || t?.last_price || t?.index_price, 0);
     return px > 0 ? px : null;
   } catch { return null; }
 }
 
-// ---------- Sizing: amount → lots ----------
-/**
- * Compute entry lot size from an amount budget.
- * - amount: budget in INR (if ccy === 'INR') or in USD (if ccy === 'USD')
- * - leverage: integer >=1
- * - entryPxUSD: price per coin in USD
- * - lotMult: coins per lot for this product
- */
+// ---------- sizing: amount → lots ----------
 function lotsFromAmount({ amount, ccy='INR', leverage=DEFAULT_LEVERAGE, entryPxUSD, lotMult=1, fxInrPerUsd=FX_INR_FALLBACK }){
   leverage = Math.max(1, Math.floor(nnum(leverage, DEFAULT_LEVERAGE)));
   lotMult  = Math.max(1, Math.floor(nnum(lotMult, 1)));
@@ -176,59 +192,87 @@ function lotsFromAmount({ amount, ccy='INR', leverage=DEFAULT_LEVERAGE, entryPxU
   const amt = nnum(amount, 0);
   if (amt <= 0 || px <= 0) return 0;
 
-  // Convert to USD margin
-  const marginUSD = (ccy.toUpperCase()==='USD') ? amt : (amt / fx);
-
-  // Target notional with leverage and a safety buffer
+  const marginUSD   = (ccy.toUpperCase()==='USD') ? amt : (amt / fx);
   const notionalUSD = marginUSD * leverage * (1 - MARGIN_BUFFER_PCT);
-
-  // coins = notional / price, lots = floor(coins / lotMult)
-  const coins  = notionalUSD / px;
-  const lots   = Math.floor(coins / lotMult);
+  const coins       = notionalUSD / px;
+  const lots        = Math.floor(coins / lotMult);
   return Math.max(1, lots);
+}
+
+// ---------- last entry side (for TP auto-correct) ----------
+const LAST_SIDE = new Map();
+function rememberSide(productSymbol, side){
+  if (!productSymbol) return;
+  const s = String(side||'').toLowerCase()==='buy' ? 'buy' : 'sell';
+  LAST_SIDE.set(productSymbol, s);
+}
+function oppositeSide(side){ return (String(side||'').toLowerCase()==='buy') ? 'sell' : 'buy'; }
+
+// ---------- learning: coins-per-lot from actual position ----------
+const LAST_ENTRY_SENT = new Map(); // psym -> { lots, ts, side }
+async function learnLotMultFromPositions(psym){
+  const last = LAST_ENTRY_SENT.get(psym);
+  if (!last || (Date.now()-last.ts) > 15_000) return;
+
+  try {
+    const pos = await listPositionsArray();
+    const row = pos.find(p => String(p?.product_symbol||p?.symbol||'').toUpperCase() === psym.toUpperCase());
+    if (!row) return;
+
+    const coinsAbs = Math.abs(Number(row.size||row.position_size||0));
+    const lotsSent = Math.max(1, Number(last.lots||0));
+    if (!coinsAbs || !lotsSent) return;
+
+    const m = coinsAbs / lotsSent;
+    if (Math.abs(m - Math.round(m)) < 1e-4 && Math.round(m) >= 1) {
+      setCachedLotMult(psym, Math.round(m));
+      LAST_ENTRY_SENT.delete(psym);
+      console.log('learned lot multiplier', { product_symbol: psym, m: Math.round(m) });
+    }
+  } catch {}
 }
 
 // ---------- order helpers ----------
 async function placeEntry(m){
   const side = (m.side||'').toLowerCase()==='buy' ? 'buy' : 'sell';
   const product_symbol = toProductSymbol(m.symbol || m.product_symbol);
-  const meta  = await getProductMeta(product_symbol);
-  const lotMult = lotMultiplierFromMeta(meta);
 
-  // 1) if qty (lots) is provided, use it directly
+  // lot multiplier from cache or meta
+  let lotMult = getCachedLotMult(product_symbol);
+  if (!lotMult) {
+    const meta = await getProductMeta(product_symbol);
+    lotMult = lotMultiplierFromMeta(meta);
+    setCachedLotMult(product_symbol, lotMult);
+  }
+
+  // 1) qty (lots) provided -> use directly
   let sizeLots = parseInt(m.qty,10);
   let usedMode = 'qty';
 
-  // 2) otherwise, compute from amount (₹/USD)
+  // 2) else derive from amount
   if (!sizeLots || sizeLots < 1) {
     const fxHint   = nnum(m.fxQuoteToINR || m.fx_quote_to_inr || m.fx || FX_INR_FALLBACK, FX_INR_FALLBACK);
     const leverage = Math.max(1, Math.floor(nnum(m.leverage || m.leverage_x || DEFAULT_LEVERAGE, DEFAULT_LEVERAGE)));
     const ccy      = String(m.amount_ccy || m.ccy || (typeof m.amount_usd !== 'undefined' ? 'USD' : 'INR')).toUpperCase();
 
-    // price: prefer msg.entry, else ticker
     let entryPxUSD = nnum(m.entry, 0);
     if (!(entryPxUSD > 0)) entryPxUSD = nnum(await getTickerPriceUSD(product_symbol), 0);
     if (!(entryPxUSD > 0)) throw new Error(`No price available for ${product_symbol}`);
 
-    // pick amount field
     let amount = undefined;
     if (typeof m.amount_inr   !== 'undefined') amount = nnum(m.amount_inr, 0);
     else if (typeof m.amount_usd !== 'undefined') amount = nnum(m.amount_usd, 0);
     else if (typeof m.order_amount !== 'undefined') amount = nnum(m.order_amount, 0);
     else if (typeof m.amount !== 'undefined') amount = nnum(m.amount, 0);
-
     if (!(amount > 0)) throw new Error('Amount-based entry requires amount_inr/amount_usd/order_amount/amount');
 
-    sizeLots = lotsFromAmount({
-      amount, ccy, leverage,
-      entryPxUSD, lotMult, fxInrPerUsd: fxHint
-    });
+    sizeLots = lotsFromAmount({ amount, ccy, leverage, entryPxUSD, lotMult, fxInrPerUsd: fxHint });
     usedMode = `${ccy==='USD'?'amount_usd':'amount_inr'}`;
   }
 
-  console.log('entry size normalization', {
-    product_symbol, side, lotMult, usedMode, sizeLots
-  });
+  sizeLots = clamp(sizeLots, 1, MAX_LOTS_PER_ORDER);
+
+  console.log('entry size normalization', { product_symbol, side, lotMult, usedMode, sizeLots });
 
   const out = await dcall('POST','/v2/orders',{
     product_symbol,
@@ -236,7 +280,12 @@ async function placeEntry(m){
     side,
     size: sizeLots
   });
+
   rememberSide(product_symbol, side);
+  LAST_ENTRY_SENT.set(product_symbol, { lots: sizeLots, ts: Date.now(), side });
+  // best-effort learning (no await)
+  learnLotMultFromPositions(product_symbol);
+
   return out;
 }
 
@@ -246,14 +295,6 @@ async function placeBracket(m){
   return dcall('POST','/v2/orders/bracket', body);
 }
 
-const LAST_SIDE = new Map();
-function rememberSide(productSymbol, side){
-  if (!productSymbol) return;
-  const s = String(side||'').toLowerCase()==='buy' ? 'buy' : 'sell';
-  LAST_SIDE.set(productSymbol, s);
-}
-function oppositeSide(side){ return (String(side||'').toLowerCase()==='buy') ? 'sell' : 'buy'; }
-
 async function placeBatch(m){
   const {action, ...bodyIn} = m;
   const body = { ...bodyIn };
@@ -262,19 +303,28 @@ async function placeBatch(m){
   try {
     const psym = body.product_symbol;
     const last = LAST_SIDE.get(psym);
-    // Normalize sizes if batch sizes were provided in COINS, not lots (optional)
-    const meta  = await getProductMeta(psym);
-    const lotMult = lotMultiplierFromMeta(meta);
+
+    // ensure we know multiplier
+    let lotMult = getCachedLotMult(psym);
+    if (!lotMult) {
+      const meta  = await getProductMeta(psym);
+      lotMult = lotMultiplierFromMeta(meta);
+      setCachedLotMult(psym, lotMult);
+    }
 
     if (Array.isArray(body.orders)) {
       body.orders = body.orders.map(o => {
         const oo = { ...o };
-        // If client sent 'size' that looks like coins (very large), convert to lots.
-        if (nnum(oo.size,0) >= lotMult && (nnum(oo.size,0) % lotMult === 0)) {
-          // ambiguous; leave as-is
-        } else if (nnum(oo.size,0) > lotMult) {
+
+        // If client provides coins (size_coins/coins), convert to lots
+        const coins = nnum(oo.size_coins ?? oo.coins, 0);
+        if (coins > 0) oo.size = Math.max(1, Math.floor(coins / lotMult));
+
+        // If size looks suspiciously like coins (very large and divisible), normalize
+        if (!coins && nnum(oo.size,0) > lotMult && Math.abs(nnum(oo.size,0) / lotMult - Math.round(nnum(oo.size,0) / lotMult)) < 1e-6) {
           oo.size = Math.max(1, Math.floor(nnum(oo.size,0) / lotMult));
         }
+
         if (last && (!oo.side || String(oo.side).toLowerCase() === last)) {
           oo.side = oppositeSide(last);
         }
@@ -293,7 +343,7 @@ async function placeBatch(m){
 const cancelAllOrders   = () => dcall('DELETE','/v2/orders/all');
 const closeAllPositions = () => dcall('POST','/v2/positions/close_all', {});
 
-// ---------- listings + flat gate ----------
+// List helpers
 async function listOpenOrdersAllPages(){
   let all = [];
   let page = 1;
@@ -328,6 +378,8 @@ async function listPositionsArray(){
   } catch(e) {}
   return [];
 }
+
+// Gate until there are no open orders and no positions.
 async function waitUntilFlat(timeoutMs = nnum(process.env.FLAT_TIMEOUT_MS,15000), pollMs = 400) {
   const end = Date.now() + timeoutMs;
   while (Date.now() < end) {
@@ -338,9 +390,10 @@ async function waitUntilFlat(timeoutMs = nnum(process.env.FLAT_TIMEOUT_MS,15000)
       const pos = await listPositionsArray();
       const hasPos = pos.some(p => Math.abs(Number(p?.size||p?.position_size||0)) > 0);
       if (!hasOrders && !hasPos) return true;
+
       console.log('…still flattening', {
         openOrders: oo.length,
-        positions: pos.map(p=>({ product_id:p.product_id, size:p.size }))
+        positions: pos.map(p=>({ product_id:p.product_id, symbol:p.product_symbol||p.symbol, size:p.size }))
       });
     } catch(e) {
       console.warn('waitUntilFlat poll error (ignoring):', e?.message || e);
