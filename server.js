@@ -359,6 +359,7 @@ async function listOpenOrdersAllPages(){
   }
   return all;
 }
+
 async function listPositionsArray(){
   try {
     const pos = await dcall('GET','/v2/positions');
@@ -377,6 +378,46 @@ async function listPositionsArray(){
     if (arr2.length) return arr2;
   } catch(e) {}
   return [];
+}
+
+// Close ONLY the symbol from webhook by sending a reduce-only market order
+async function closePositionBySymbol(symbolOrProductSymbol){
+  const psym = toProductSymbol(symbolOrProductSymbol);
+  if (!psym) throw new Error('closePositionBySymbol: missing symbol/product_symbol');
+
+  const pos = await listPositionsArray();
+  const row = pos.find(p =>
+    String(p?.product_symbol || p?.symbol || '').toUpperCase() === psym.toUpperCase()
+  );
+
+  const sizeCoins = Number(row?.size || row?.position_size || 0);
+  if (!sizeCoins || Math.abs(sizeCoins) < 1e-12) {
+    console.log('closePositionBySymbol: no open position for', psym);
+    return { ok:true, skipped:true, reason:'no_position' };
+  }
+
+  // lot multiplier from cache or meta
+  let lotMult = getCachedLotMult(psym);
+  if (!lotMult) {
+    const meta = await getProductMeta(psym);
+    lotMult = lotMultiplierFromMeta(meta);
+    setCachedLotMult(psym, lotMult);
+  }
+
+  const absCoins = Math.abs(sizeCoins);
+  // Use CEIL so we don't leave a tiny remainder; reduce_only prevents flipping/opening extra
+  const lots = Math.max(1, Math.ceil((absCoins / lotMult) - 1e-12));
+  const side = sizeCoins > 0 ? 'sell' : 'buy';
+
+  console.log('closePositionBySymbol:', { psym, sizeCoins, lotMult, lots, side });
+
+  return dcall('POST','/v2/orders',{
+    product_symbol: psym,
+    order_type: 'market_order',
+    side,
+    size: lots,
+    reduce_only: true
+  });
 }
 
 // Gate until there are no open orders and no positions.
@@ -427,6 +468,53 @@ app.post('/tv', async (req, res) => {
 
     // Ignore pure EXIT logs from chart
     if (action === 'EXIT') return res.json({ ok:true, ignored:'EXIT' });
+
+    // --------- YOUR "CANCAL" / CANCEL handler (cancel orders + close position) ---------
+    // Defaults: if you don't send flags, it will do BOTH.
+    if (action === 'CANCAL' || action === 'CANCEL') {
+      const doCancelOrders = (typeof msg.cancel_orders === 'undefined') ? true : !!msg.cancel_orders;
+      const doClosePos     = (typeof msg.close_position === 'undefined') ? true : !!msg.close_position;
+
+      const steps = {
+        cancel_orders: false,
+        close_position: false,
+        close_mode: null,
+        cancel_error: null,
+        close_error: null
+      };
+
+      if (doCancelOrders) {
+        try {
+          await cancelAllOrders();
+          steps.cancel_orders = true;
+        } catch (e) {
+          steps.cancel_error = String(e?.message || e);
+          console.warn('cancelAllOrders failed:', e?.message || e);
+        }
+      }
+
+      if (doClosePos) {
+        try {
+          // Prefer closing ONLY the symbol you sent
+          const sym = msg.symbol || msg.product_symbol;
+          if (sym) {
+            await closePositionBySymbol(sym);
+            steps.close_mode = 'by_symbol';
+          } else {
+            await closeAllPositions();
+            steps.close_mode = 'close_all_positions';
+          }
+          steps.close_position = true;
+        } catch (e) {
+          steps.close_error = String(e?.message || e);
+          console.warn('close position failed:', e?.message || e);
+        }
+      }
+
+      const flat = await waitUntilFlat();
+      return res.json({ ok:true, did:'CANCAL', steps, flat });
+    }
+    // -------------------------------------------------------------------------------
 
     // Explicit cleanup from Pine
     if (action === 'DELTA_CANCEL_ALL' || action === 'CANCEL_ALL') {
