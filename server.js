@@ -1,4 +1,6 @@
-// server.js
+// server.js (FULL) — includes: GLOBAL queue/lock, sig_id+seq idempotency, scope=ALL close-all,
+// require_flat gating for ENTER, and avoids cancel/close inside ENTER when Pine already sent CANCAL.
+
 require('dotenv').config();
 const express = require('express');
 const crypto  = require('crypto');
@@ -11,9 +13,23 @@ function clamp(n,min,max){ return Math.min(Math.max(n,min),max); }
 function nnum(x, d=0){ const n = Number(x); return Number.isFinite(n) ? n : d; }
 function toProductSymbol(sym){
   if(!sym) return sym;
-  let s = String(sym).replace('.P',''); // remove TradingView .P suffix if present
-  if(s.includes(':')) s = s.split(':').pop(); // remove prefix like BINANCE:
+  let s = String(sym).replace('.P','');           // remove TradingView .P suffix if present
+  if(s.includes(':')) s = s.split(':').pop();     // remove prefix like BINANCE:
   return s;
+}
+
+// ---------- global queue (serializes webhook execution) ----------
+const QUEUE = new Map(); // key -> Promise chain
+function enqueue(key, fn) {
+  const prev = QUEUE.get(key) || Promise.resolve();
+  const next = prev
+    .catch(() => {})          // keep chain alive even if prev errored
+    .then(fn)
+    .finally(() => {
+      if (QUEUE.get(key) === next) QUEUE.delete(key);
+    });
+  QUEUE.set(key, next);
+  return next;
 }
 
 // -------------------- app --------------------
@@ -52,14 +68,21 @@ const HDR_TS        = process.env.DELTA_HDR_TS      || 'timestamp';
 
 // Amount-based sizing defaults
 const DEFAULT_LEVERAGE   = nnum(process.env.DEFAULT_LEVERAGE, 10);
-const FX_INR_FALLBACK    = nnum(process.env.FX_INR_FALLBACK, 85);  // ₹ per USD
+const FX_INR_FALLBACK    = nnum(process.env.FX_INR_FALLBACK, 85);     // ₹ per USD
 const MARGIN_BUFFER_PCT  = nnum(process.env.MARGIN_BUFFER_PCT, 0.03); // 3%
 const MAX_LOTS_PER_ORDER = nnum(process.env.MAX_LOTS_PER_ORDER, 200000);
+
+const FLAT_TIMEOUT_MS    = nnum(process.env.FLAT_TIMEOUT_MS, 15000);
+const FLAT_POLL_MS       = nnum(process.env.FLAT_POLL_MS, 400);
 
 // ---------- idempotency (drops dupes ~60s) ----------
 const SEEN = new Map();              // key -> ts(ms)
 const SEEN_TTL_MS = 60_000;
+
+// ✅ includes sig_id + seq
 function seenKey(msg){
+  const sig = String(msg.sig_id || msg.signal_id || '');
+  const seq = String(msg.seq ?? '');
   const p = [
     String(msg.action||''),
     String(msg.product_symbol||msg.symbol||''),
@@ -67,11 +90,13 @@ function seenKey(msg){
     String(msg.qty||''),
     String(msg.entry||''),
     String(msg.strategy_id||''),
-    String(msg.sig_id||''),
+    sig,
+    seq,
     String(msg.amount||msg.amount_inr||msg.amount_usd||msg.order_amount||'')
   ].join('|');
   return crypto.createHash('sha1').update(p).digest('hex');
 }
+
 function remember(k){
   SEEN.set(k, Date.now());
   for (const [kk, ts] of SEEN) {
@@ -271,7 +296,6 @@ async function placeEntry(m){
   }
 
   sizeLots = clamp(sizeLots, 1, MAX_LOTS_PER_ORDER);
-
   console.log('entry size normalization', { product_symbol, side, lotMult, usedMode, sizeLots });
 
   const out = await dcall('POST','/v2/orders',{
@@ -283,8 +307,7 @@ async function placeEntry(m){
 
   rememberSide(product_symbol, side);
   LAST_ENTRY_SENT.set(product_symbol, { lots: sizeLots, ts: Date.now(), side });
-  // best-effort learning (no await)
-  learnLotMultFromPositions(product_symbol);
+  learnLotMultFromPositions(product_symbol); // best-effort (no await)
 
   return out;
 }
@@ -421,7 +444,7 @@ async function closePositionBySymbol(symbolOrProductSymbol){
 }
 
 // Gate until there are no open orders and no positions.
-async function waitUntilFlat(timeoutMs = nnum(process.env.FLAT_TIMEOUT_MS,15000), pollMs = 400) {
+async function waitUntilFlat(timeoutMs = FLAT_TIMEOUT_MS, pollMs = FLAT_POLL_MS) {
   const end = Date.now() + timeoutMs;
   while (Date.now() < end) {
     try {
@@ -434,7 +457,11 @@ async function waitUntilFlat(timeoutMs = nnum(process.env.FLAT_TIMEOUT_MS,15000)
 
       console.log('…still flattening', {
         openOrders: oo.length,
-        positions: pos.map(p=>({ product_id:p.product_id, symbol:p.product_symbol||p.symbol, size:p.size }))
+        positions: pos.map(p=>({
+          product_id: p.product_id,
+          symbol: p.product_symbol||p.symbol,
+          size: p.size || p.position_size
+        }))
       });
     } catch(e) {
       console.warn('waitUntilFlat poll error (ignoring):', e?.message || e);
@@ -461,94 +488,113 @@ app.post('/tv', async (req, res) => {
     const action = String(msg.action || '').toUpperCase();
     console.log('\n=== INCOMING /tv ===\n', JSON.stringify(msg));
 
-    // ---- idempotency guard ----
-    const key = seenKey(msg);
-    if (SEEN.has(key)) return res.json({ ok:true, dedup:true });
-    remember(key);
+    const out = await enqueue('GLOBAL', async () => {
 
-    // Ignore pure EXIT logs from chart
-    if (action === 'EXIT') return res.json({ ok:true, ignored:'EXIT' });
+      // ---- idempotency guard ----
+      const key = seenKey(msg);
+      if (SEEN.has(key)) return { ok:true, dedup:true };
+      remember(key);
 
-    // --------- YOUR "CANCAL" / CANCEL handler (cancel orders + close position) ---------
-    // Defaults: if you don't send flags, it will do BOTH.
-    if (action === 'CANCAL' || action === 'CANCEL') {
-      const doCancelOrders = (typeof msg.cancel_orders === 'undefined') ? true : !!msg.cancel_orders;
-      const doClosePos     = (typeof msg.close_position === 'undefined') ? true : !!msg.close_position;
+      // Ignore pure EXIT logs from chart
+      if (action === 'EXIT') return { ok:true, ignored:'EXIT' };
 
-      const steps = {
-        cancel_orders: false,
-        close_position: false,
-        close_mode: null,
-        cancel_error: null,
-        close_error: null
-      };
+      // --------- CANCAL / CANCEL handler (cancel orders + close position(s)) ---------
+      if (action === 'CANCAL' || action === 'CANCEL') {
+        const doCancelOrders = (typeof msg.cancel_orders === 'undefined') ? true : !!msg.cancel_orders;
+        const doClosePos     = (typeof msg.close_position === 'undefined') ? true : !!msg.close_position;
 
-      if (doCancelOrders) {
-        try {
-          await cancelAllOrders();
-          steps.cancel_orders = true;
-        } catch (e) {
-          steps.cancel_error = String(e?.message || e);
-          console.warn('cancelAllOrders failed:', e?.message || e);
-        }
-      }
+        const steps = {
+          cancel_orders: false,
+          close_position: false,
+          close_mode: null,
+          cancel_error: null,
+          close_error: null
+        };
 
-      if (doClosePos) {
-        try {
-          // Prefer closing ONLY the symbol you sent
-          const sym = msg.symbol || msg.product_symbol;
-          if (sym) {
-            await closePositionBySymbol(sym);
-            steps.close_mode = 'by_symbol';
-          } else {
-            await closeAllPositions();
-            steps.close_mode = 'close_all_positions';
+        if (doCancelOrders) {
+          try {
+            await cancelAllOrders();
+            steps.cancel_orders = true;
+          } catch (e) {
+            steps.cancel_error = String(e?.message || e);
+            console.warn('cancelAllOrders failed:', e?.message || e);
           }
-          steps.close_position = true;
-        } catch (e) {
-          steps.close_error = String(e?.message || e);
-          console.warn('close position failed:', e?.message || e);
         }
+
+        if (doClosePos) {
+          try {
+            // ✅ scope=ALL means "close all positions", per your requirement
+            const scopeAll = String(msg.scope||'').toUpperCase() === 'ALL' || !!msg.close_all;
+
+            if (scopeAll) {
+              await closeAllPositions();
+              steps.close_mode = 'close_all_positions';
+            } else {
+              // Prefer closing ONLY the symbol you sent
+              const sym = msg.symbol || msg.product_symbol;
+              if (sym) {
+                await closePositionBySymbol(sym);
+                steps.close_mode = 'by_symbol';
+              } else {
+                await closeAllPositions();
+                steps.close_mode = 'close_all_positions';
+              }
+            }
+
+            steps.close_position = true;
+          } catch (e) {
+            steps.close_error = String(e?.message || e);
+            console.warn('close position failed:', e?.message || e);
+          }
+        }
+
+        const flat = await waitUntilFlat();
+        return { ok:true, did:'CANCAL', steps, flat };
+      }
+      // ---------------------------------------------------------------------------
+
+      // Explicit cleanup from Pine (still supported)
+      if (action === 'DELTA_CANCEL_ALL' || action === 'CANCEL_ALL') {
+        const out = await cancelAllOrders();
+        return { ok:true, did:'cancel_all_orders', delta: out };
+      }
+      if (action === 'CLOSE_POSITION') {
+        const out = await closeAllPositions();
+        return { ok:true, did:'close_all_positions', delta: out };
       }
 
-      const flat = await waitUntilFlat();
-      return res.json({ ok:true, did:'CANCAL', steps, flat });
-    }
-    // -------------------------------------------------------------------------------
+      // Bracket passthrough
+      if (msg.stop_loss_order || msg.take_profit_order) {
+        const r = await placeBracket(msg);
+        return { ok:true, step:'bracket', r };
+      }
 
-    // Explicit cleanup from Pine
-    if (action === 'DELTA_CANCEL_ALL' || action === 'CANCEL_ALL') {
-      const out = await cancelAllOrders();
-      return res.json({ ok:true, did:'cancel_all_orders', delta: out });
-    }
-    if (action === 'CLOSE_POSITION') {
-      const out = await closeAllPositions();
-      return res.json({ ok:true, did:'close_all_positions', delta: out });
-    }
+      // Batch (TPs) passthrough — with auto-correct & optional size-normalize
+      if (msg.orders) {
+        const r = await placeBatch(msg);
+        return { ok:true, step:'batch', r };
+      }
 
-    // Bracket passthrough
-    if (msg.stop_loss_order || msg.take_profit_order) {
-      const r = await placeBracket(msg);
-      return res.json({ ok:true, step:'bracket', r });
-    }
+      // ENTER / FLIP:
+      // ✅ IMPORTANT: If Pine is sending CANCAL on signal bar, do NOT cancel/close here again.
+      // ✅ But DO gate until flat if require_flat=true (default true).
+      if (action === 'ENTER' || action === 'FLIP') {
+        const requireFlat = (typeof msg.require_flat === 'undefined') ? true : !!msg.require_flat;
+        if (requireFlat) {
+          const flat = await waitUntilFlat();
+          console.log('flat gate result:', flat);
+        }
 
-    // Batch (TPs) passthrough — with auto-correct & optional size-normalize
-    if (msg.orders) {
-      const r = await placeBatch(msg);
-      return res.json({ ok:true, step:'batch', r });
-    }
+        const r = await placeEntry(msg);
+        return { ok:true, step:'entry', r };
+      }
 
-    // ENTER / FLIP: cancel+close, then gate until flat
-    if (action === 'ENTER' || action === 'FLIP') {
-      try { await cancelAllOrders(); } catch(e) { console.warn('cancelAllOrders failed:', e?.message||e); }
-      try { await closeAllPositions(); } catch(e) { console.warn('closeAllPositions failed:', e?.message||e); }
-      const flat = await waitUntilFlat();
-      console.log('flat gate result:', flat);
-    }
+      // Fallback: treat as entry
+      const r = await placeEntry(msg);
+      return { ok:true, step:'entry', r };
+    });
 
-    // Market entry
-    const r = await placeEntry(msg);
-    return res.json({ ok:true, step:'entry', r });
+    return res.json(out);
 
   } catch (e) {
     console.error('✖ ERROR:', e);
