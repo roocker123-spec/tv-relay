@@ -1,8 +1,9 @@
 // server.js (FULL) — GLOBAL queue/lock, sig_id+seq idempotency,
-// STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2),
+// STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2) -> BRACKET_SL(seq3),
 // BUT: ENTER can self-flatten (cancel_orders+close_position) so missed CANCAL won't brick flips.
 // require_flat gating actually blocks ENTER if flattening not complete,
 // and BATCH_TPS is blocked unless ENTER happened for same sig_id.
+// BRACKET_SL is blocked unless BATCH_TPS happened for same sig_id.
 
 require('dotenv').config();
 const express = require('express');
@@ -102,7 +103,9 @@ function seenKey(msg){
     String(msg.strategy_id||''),
     sig,
     seq,
-    String(msg.amount||msg.amount_inr||msg.amount_usd||msg.order_amount||'')
+    String(msg.amount||msg.amount_inr||msg.amount_usd||msg.order_amount||''),
+    // include stop fields so BRACKET_SL is deduped correctly too
+    String(msg.stop_price||msg.stop||'')
   ].join('|');
   return crypto.createHash('sha1').update(p).digest('hex');
 }
@@ -394,6 +397,43 @@ async function placeBatch(m){
   }
 
   return dcall('POST','/v2/orders/batch', body);
+}
+
+// ---------- STOP-LOSS helper (reduce-only stop loss) ----------
+async function placeStopLoss(m){
+  const product_symbol = toProductSymbol(m.symbol || m.product_symbol);
+  if(!product_symbol) throw new Error('placeStopLoss: missing product_symbol');
+
+  // Pine sends "side" as exit side (long -> sell, short -> buy)
+  const side = (String(m.side||'').toLowerCase()==='buy') ? 'buy' : 'sell';
+
+  let sizeLots = parseInt(m.qty, 10);
+  sizeLots = clamp(Number.isFinite(sizeLots) ? sizeLots : 0, 1, MAX_LOTS_PER_ORDER);
+
+  const stop_price = nnum(m.stop_price, 0);
+  if (!(stop_price > 0)) throw new Error('placeStopLoss: missing/invalid stop_price');
+
+  const stop_trigger_method = String(m.stop_trigger_method || 'mark_price');
+
+  // NOTE: Delta’s exact stop fields can differ by product.
+  // This structure matches typical Delta stop orders:
+  return dcall('POST','/v2/orders',{
+    product_symbol,
+    side,
+    size: sizeLots,
+
+    // Market execution upon trigger
+    order_type: 'market_order',
+
+    // Stop-loss fields
+    stop_order_type: 'stop_loss_order',
+    stop_price: String(stop_price),
+    stop_trigger_method,
+
+    // Make sure it only reduces and never flips
+    reduce_only: true,
+    close_on_trigger: true
+  });
 }
 
 // ---------- CANCEL/CLOSE + listings ----------
@@ -729,8 +769,9 @@ app.post('/tv', async (req, res) => {
         return { ok:true, did:'close_all_positions', delta: out };
       }
 
-      // Bracket passthrough
-      if (msg.stop_loss_order || msg.take_profit_order) {
+      // Bracket passthrough (ONLY when not using strict sequencer)
+      // In STRICT mode, your Pine should send BRACKET_SL action at seq=3 instead.
+      if (!STRICT_SEQUENCE && (msg.stop_loss_order || msg.take_profit_order)) {
         const r = await placeBracket(msg);
         return { ok:true, step:'bracket', r };
       }
@@ -755,6 +796,34 @@ app.post('/tv', async (req, res) => {
         }
 
         return { ok:true, step:'batch', r };
+      }
+
+      // ---------- BRACKET_SL (stop loss) — STRICT: seq=3 requires BATCH_TPS(seq2) already ----------
+      if (action === 'BRACKET_SL') {
+
+        if (STRICT_SEQUENCE) {
+          if (!sigId) return { ok:true, ignored:'BRACKET_SL_missing_sig_id' };
+          if (Number.isFinite(seq) && seq !== 3) {
+            return { ok:true, ignored:'BRACKET_SL_seq_mismatch', expected:3, got: msg.seq, sig_id: sigId };
+          }
+
+          const st = getSigState(sigId);
+          if (!st || st.lastSeq < 2) {
+            return { ok:true, ignored:'BRACKET_SL_without_BATCH_TPS', sig_id: sigId, have: st ? st.lastSeq : null };
+          }
+
+          if (st.lastSeq >= 3) {
+            return { ok:true, ignored:'BRACKET_SL_already_seen', sig_id: sigId, have: st.lastSeq };
+          }
+        }
+
+        const r = await placeStopLoss(msg);
+
+        if (STRICT_SEQUENCE && sigId) {
+          setSigState(sigId, { lastSeq: 3, symbol: psym });
+        }
+
+        return { ok:true, step:'bracket_sl', r };
       }
 
       // ENTER / FLIP:
