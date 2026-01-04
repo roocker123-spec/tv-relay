@@ -571,6 +571,10 @@ app.post('/tv', async (req, res) => {
 
       // Batch (TPs) passthrough — with auto-correct & optional size-normalize
       if (msg.orders) {
+        // ===== EXTRA SAFETY (3 lines) =====
+        if (action !== 'BATCH_TPS') return { ok:true, ignored:'orders_without_BATCH_TPS' };
+        if (Number(msg.seq) !== 2) return { ok:true, ignored:'batch_seq_mismatch', got: msg.seq };
+        // =================================
         const r = await placeBatch(msg);
         return { ok:true, step:'batch', r };
       }
