@@ -1,5 +1,6 @@
-// server.js (FULL, corrected) — GLOBAL queue/lock, sig_id+seq idempotency,
-// STRICT sequence enforcement: CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
+// server.js (FULL) — GLOBAL queue/lock, sig_id+seq idempotency,
+// STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2),
+// BUT: ENTER can self-flatten (cancel_orders+close_position) so missed CANCAL won't brick flips.
 // require_flat gating actually blocks ENTER if flattening not complete,
 // and BATCH_TPS is blocked unless ENTER happened for same sig_id.
 
@@ -19,6 +20,10 @@ function toProductSymbol(sym){
   if(s.includes(':')) s = s.split(':').pop();     // remove prefix like BINANCE:
   return s;
 }
+function isScopeAll(msg){
+  return String(msg.scope||'').toUpperCase() === 'ALL' || !!msg.close_all;
+}
+function safeUpper(x){ return String(x||'').toUpperCase(); }
 
 // ---------- global queue (serializes webhook execution) ----------
 const QUEUE = new Map(); // key -> Promise chain
@@ -395,6 +400,52 @@ async function placeBatch(m){
 const cancelAllOrders   = () => dcall('DELETE','/v2/orders/all');
 const closeAllPositions = () => dcall('POST','/v2/positions/close_all', {});
 
+// Try symbol-scoped cancel (preferred if you trade multiple symbols)
+// If Delta endpoint differs, it will fail harmlessly and we can optionally fallback to cancelAllOrders.
+async function cancelOrderById(orderId){
+  if (!orderId) return { ok:true, skipped:true, reason:'missing_order_id' };
+  return dcall('DELETE', `/v2/orders/${orderId}`);
+}
+async function cancelOrdersBySymbol(psym, { fallbackAll=false } = {}){
+  const sym = toProductSymbol(psym);
+  if (!sym) return { ok:true, skipped:true, reason:'missing_symbol' };
+
+  let open = [];
+  try {
+    open = await listOpenOrdersAllPages();
+  } catch(e) {
+    if (fallbackAll) {
+      await cancelAllOrders();
+      return { ok:true, fallback:'cancel_all_orders' };
+    }
+    throw e;
+  }
+
+  const mine = open.filter(o => safeUpper(o?.product_symbol||o?.symbol) === safeUpper(sym));
+  if (!mine.length) {
+    return { ok:true, skipped:true, reason:'no_open_orders_for_symbol', symbol: sym };
+  }
+
+  let cancelled = 0, failed = 0;
+  for (const o of mine){
+    const oid = o?.id || o?.order_id;
+    try {
+      await cancelOrderById(oid);
+      cancelled++;
+    } catch(e){
+      failed++;
+      console.warn('cancelOrdersBySymbol: cancel failed', { symbol: sym, oid, err: e?.message || e });
+    }
+  }
+
+  if (failed && fallbackAll) {
+    await cancelAllOrders();
+    return { ok:true, cancelled, failed, fallback:'cancel_all_orders' };
+  }
+
+  return { ok:true, cancelled, failed, symbol: sym };
+}
+
 // List helpers
 async function listOpenOrdersAllPages(){
   let all = [];
@@ -439,7 +490,7 @@ async function closePositionBySymbol(symbolOrProductSymbol){
 
   const pos = await listPositionsArray();
   const row = pos.find(p =>
-    String(p?.product_symbol || p?.symbol || '').toUpperCase() === psym.toUpperCase()
+    safeUpper(p?.product_symbol || p?.symbol) === safeUpper(psym)
   );
 
   const sizeCoins = Number(row?.size || row?.position_size || 0);
@@ -472,7 +523,7 @@ async function closePositionBySymbol(symbolOrProductSymbol){
   });
 }
 
-// Gate until there are no open orders and no positions.
+// Gate until there are no open orders and no positions (GLOBAL).
 async function waitUntilFlat(timeoutMs = FLAT_TIMEOUT_MS, pollMs = FLAT_POLL_MS) {
   const end = Date.now() + timeoutMs;
   while (Date.now() < end) {
@@ -484,7 +535,7 @@ async function waitUntilFlat(timeoutMs = FLAT_TIMEOUT_MS, pollMs = FLAT_POLL_MS)
       const hasPos = pos.some(p => Math.abs(Number(p?.size||p?.position_size||0)) > 0);
       if (!hasOrders && !hasPos) return true;
 
-      console.log('…still flattening', {
+      console.log('…still flattening (GLOBAL)', {
         openOrders: oo.length,
         positions: pos.map(p=>({
           product_id: p.product_id,
@@ -498,6 +549,103 @@ async function waitUntilFlat(timeoutMs = FLAT_TIMEOUT_MS, pollMs = FLAT_POLL_MS)
     await sleep(pollMs);
   }
   return false;
+}
+
+// Gate until there are no open orders and no position for ONE SYMBOL.
+async function waitUntilFlatSymbol(psym, timeoutMs = FLAT_TIMEOUT_MS, pollMs = FLAT_POLL_MS) {
+  const sym = toProductSymbol(psym);
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    try {
+      const oo  = await listOpenOrdersAllPages();
+      const mineOrders = oo.filter(o => safeUpper(o?.product_symbol||o?.symbol) === safeUpper(sym));
+      const hasOrders = mineOrders.some(o => ['open','pending','triggered','untriggered']
+        .includes(String(o?.state||o?.status||'').toLowerCase()));
+
+      const pos = await listPositionsArray();
+      const minePos = pos.find(p => safeUpper(p?.product_symbol||p?.symbol) === safeUpper(sym));
+      const hasPos = minePos ? (Math.abs(Number(minePos?.size||minePos?.position_size||0)) > 0) : false;
+
+      if (!hasOrders && !hasPos) return true;
+
+      console.log('…still flattening (SYMBOL)', {
+        symbol: sym,
+        openOrders: mineOrders.length,
+        position: minePos ? { size: minePos.size || minePos.position_size } : null
+      });
+    } catch(e) {
+      console.warn('waitUntilFlatSymbol poll error (ignoring):', e?.message || e);
+    }
+    await sleep(pollMs);
+  }
+  return false;
+}
+
+// Performs flatten: cancel orders + close positions (symbol or all), then optional wait-flat.
+async function flattenFromMsg(msg, psym){
+  const scopeAll = isScopeAll(msg);
+
+  const doCancelOrders = (typeof msg.cancel_orders === 'undefined') ? true : !!msg.cancel_orders;
+  const doClosePos     = (typeof msg.close_position === 'undefined') ? true : !!msg.close_position;
+
+  // If you want strict safety for multi-symbol accounts:
+  // - send msg.cancel_orders_scope="SYMBOL" to avoid cancelling everything.
+  const cancelScope = String(msg.cancel_orders_scope || '').toUpperCase(); // "SYMBOL" | "" (default)
+  const cancelFallbackAll = !!msg.cancel_fallback_all;
+
+  const steps = {
+    cancel_orders: false,
+    close_position: false,
+    cancel_mode: null,
+    close_mode: null,
+    cancel_error: null,
+    close_error: null
+  };
+
+  if (doCancelOrders) {
+    try {
+      if (scopeAll) {
+        await cancelAllOrders();
+        steps.cancel_mode = 'cancel_all_orders';
+      } else if (cancelScope === 'SYMBOL') {
+        await cancelOrdersBySymbol(psym, { fallbackAll: cancelFallbackAll });
+        steps.cancel_mode = 'cancel_symbol_orders';
+      } else {
+        // default behavior (single-symbol users): cancel all orders
+        await cancelAllOrders();
+        steps.cancel_mode = 'cancel_all_orders';
+      }
+      steps.cancel_orders = true;
+    } catch (e) {
+      steps.cancel_error = String(e?.message || e);
+      console.warn('flatten cancel failed:', e?.message || e);
+    }
+  }
+
+  if (doClosePos) {
+    try {
+      if (scopeAll) {
+        await closeAllPositions();
+        steps.close_mode = 'close_all_positions';
+      } else {
+        // Prefer closing ONLY the symbol you sent
+        const sym = msg.symbol || msg.product_symbol || psym;
+        if (sym) {
+          await closePositionBySymbol(sym);
+          steps.close_mode = 'close_by_symbol';
+        } else {
+          await closeAllPositions();
+          steps.close_mode = 'close_all_positions';
+        }
+      }
+      steps.close_position = true;
+    } catch (e) {
+      steps.close_error = String(e?.message || e);
+      console.warn('flatten close failed:', e?.message || e);
+    }
+  }
+
+  return steps;
 }
 
 // ---------- health ----------
@@ -538,10 +686,9 @@ app.post('/tv', async (req, res) => {
       // Ignore pure EXIT logs from chart
       if (action === 'EXIT') return { ok:true, ignored:'EXIT' };
 
-      // ---- STRICT SEQUENCE GUARDS (sig_id + seq) ----
+      // ---- STRICT SEQUENCE SYMBOL BIND (sig_id) ----
       if (STRICT_SEQUENCE && sigId && Number.isFinite(seq)) {
         const st = getSigState(sigId) || { lastSeq: -1, symbol: psym };
-        // optional symbol bind (helps if sig_id accidentally reused)
         if (st.symbol && psym && st.symbol.toUpperCase() !== psym.toUpperCase()) {
           // new symbol under same sig_id → reset state
           setSigState(sigId, { lastSeq: -1, symbol: psym });
@@ -555,57 +702,15 @@ app.post('/tv', async (req, res) => {
           return { ok:true, ignored:'CANCAL_seq_mismatch', expected:0, got: seq, sig_id: sigId };
         }
 
-        const doCancelOrders = (typeof msg.cancel_orders === 'undefined') ? true : !!msg.cancel_orders;
-        const doClosePos     = (typeof msg.close_position === 'undefined') ? true : !!msg.close_position;
+        const steps = await flattenFromMsg(msg, psym);
 
-        const steps = {
-          cancel_orders: false,
-          close_position: false,
-          close_mode: null,
-          cancel_error: null,
-          close_error: null
-        };
-
-        if (doCancelOrders) {
-          try {
-            await cancelAllOrders();
-            steps.cancel_orders = true;
-          } catch (e) {
-            steps.cancel_error = String(e?.message || e);
-            console.warn('cancelAllOrders failed:', e?.message || e);
-          }
+        // default require_flat true
+        const requireFlat = (typeof msg.require_flat === 'undefined') ? true : !!msg.require_flat;
+        let flat = true;
+        if (requireFlat) {
+          flat = isScopeAll(msg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
         }
 
-        if (doClosePos) {
-          try {
-            // ✅ scope=ALL means "close all positions", per your requirement
-            const scopeAll = String(msg.scope||'').toUpperCase() === 'ALL' || !!msg.close_all;
-
-            if (scopeAll) {
-              await closeAllPositions();
-              steps.close_mode = 'close_all_positions';
-            } else {
-              // Prefer closing ONLY the symbol you sent
-              const sym = msg.symbol || msg.product_symbol;
-              if (sym) {
-                await closePositionBySymbol(sym);
-                steps.close_mode = 'by_symbol';
-              } else {
-                await closeAllPositions();
-                steps.close_mode = 'close_all_positions';
-              }
-            }
-
-            steps.close_position = true;
-          } catch (e) {
-            steps.close_error = String(e?.message || e);
-            console.warn('close position failed:', e?.message || e);
-          }
-        }
-
-        const flat = await waitUntilFlat();
-
-        // record strict state
         if (STRICT_SEQUENCE && sigId) {
           setSigState(sigId, { lastSeq: 0, symbol: psym });
         }
@@ -638,11 +743,9 @@ app.post('/tv', async (req, res) => {
         if (STRICT_SEQUENCE) {
           if (!sigId) return { ok:true, ignored:'BATCH_TPS_missing_sig_id' };
           const st = getSigState(sigId);
-          // must have ENTER registered
           if (!st || st.lastSeq < 1) {
             return { ok:true, ignored:'BATCH_TPS_without_ENTER', sig_id: sigId, have: st ? st.lastSeq : null };
           }
-          // optional: also require lastSeq==1 or >=1; then advance to 2
         }
 
         const r = await placeBatch(msg);
@@ -655,32 +758,32 @@ app.post('/tv', async (req, res) => {
       }
 
       // ENTER / FLIP:
-      // STRICT: require sig_id + seq=1 AND must have had CANCAL(seq0) for same sig_id (so order is guaranteed)
+      // STRICT: prefer seq=1 (if provided). ENTER is allowed even if CANCAL missing (self-flatten can recover).
       if (action === 'ENTER' || action === 'FLIP') {
 
         if (STRICT_SEQUENCE) {
           if (!sigId) return { ok:true, ignored:'ENTER_missing_sig_id' };
           if (Number.isFinite(seq) && seq !== 1) return { ok:true, ignored:'ENTER_seq_mismatch', expected:1, got: msg.seq };
-
-          const st = getSigState(sigId);
-          if (!st || st.lastSeq < 0) {
-            // never saw CANCAL for this sig_id
-            return { ok:true, ignored:'ENTER_without_CANCAL', sig_id: sigId, have: st ? st.lastSeq : null };
-          }
-          if (st.lastSeq >= 1) {
-            // ENTER already processed for this sig_id
-            return { ok:true, ignored:'ENTER_already_seen', sig_id: sigId, have: st.lastSeq };
-          }
         }
 
-        // ✅ IMPORTANT: If Pine is sending CANCAL on signal bar, do NOT cancel/close here again.
-        // ✅ But DO gate until flat if require_flat=true (default true).
+        const st = (STRICT_SEQUENCE && sigId) ? (getSigState(sigId) || { lastSeq: -1, symbol: psym }) : null;
+
+        // If ENTER already processed for this sig_id, ignore duplicates (idempotency already helps, this is extra safety)
+        if (STRICT_SEQUENCE && st && st.lastSeq >= 1) {
+          return { ok:true, ignored:'ENTER_already_seen', sig_id: sigId, have: st.lastSeq };
+        }
+
+        // ✅ KEY ADDITION:
+        // ENTER can optionally flatten too (cancel_orders + close_position) so a missed CANCAL won't brick flips.
+        // Defaults: true unless you explicitly send cancel_orders:false / close_position:false
+        const steps = await flattenFromMsg(msg, psym);
+
+        // ✅ require_flat gating (default true): actually block entry if not flat.
         const requireFlat = (typeof msg.require_flat === 'undefined') ? true : !!msg.require_flat;
         if (requireFlat) {
-          const flat = await waitUntilFlat();
+          const flat = isScopeAll(msg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
           console.log('flat gate result:', flat);
-          // ✅ FIX: actually block entry if not flat
-          if (!flat) return { ok:false, error:'require_flat_timeout', sig_id: sigId };
+          if (!flat) return { ok:false, error:'require_flat_timeout', sig_id: sigId, steps };
         }
 
         const r = await placeEntry(msg);
@@ -689,7 +792,9 @@ app.post('/tv', async (req, res) => {
           setSigState(sigId, { lastSeq: 1, symbol: psym });
         }
 
-        return { ok:true, step:'entry', r };
+        // Helpful flag if we recovered without having seen CANCAL
+        const recovered = (STRICT_SEQUENCE && st && st.lastSeq < 0);
+        return { ok:true, step:'entry', recovered_without_cancal: !!recovered, steps, r };
       }
 
       // Fallback: treat as entry (you can keep this OFF in strict mode)
