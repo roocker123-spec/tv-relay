@@ -1,5 +1,7 @@
-// server.js (FULL) — includes: GLOBAL queue/lock, sig_id+seq idempotency, scope=ALL close-all,
-// require_flat gating for ENTER, and avoids cancel/close inside ENTER when Pine already sent CANCAL.
+// server.js (FULL, corrected) — GLOBAL queue/lock, sig_id+seq idempotency,
+// STRICT sequence enforcement: CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2)
+// require_flat gating actually blocks ENTER if flattening not complete,
+// and BATCH_TPS is blocked unless ENTER happened for same sig_id.
 
 require('dotenv').config();
 const express = require('express');
@@ -75,6 +77,9 @@ const MAX_LOTS_PER_ORDER = nnum(process.env.MAX_LOTS_PER_ORDER, 200000);
 const FLAT_TIMEOUT_MS    = nnum(process.env.FLAT_TIMEOUT_MS, 15000);
 const FLAT_POLL_MS       = nnum(process.env.FLAT_POLL_MS, 400);
 
+// ---------- STRICT sequence (default ON) ----------
+const STRICT_SEQUENCE = String(process.env.STRICT_SEQUENCE || 'true').toLowerCase() !== 'false';
+
 // ---------- idempotency (drops dupes ~60s) ----------
 const SEEN = new Map();              // key -> ts(ms)
 const SEEN_TTL_MS = 60_000;
@@ -97,7 +102,7 @@ function seenKey(msg){
   return crypto.createHash('sha1').update(p).digest('hex');
 }
 
-function remember(k){
+function rememberSeen(k){
   SEEN.set(k, Date.now());
   for (const [kk, ts] of SEEN) {
     if (Date.now()-ts > SEEN_TTL_MS) SEEN.delete(kk);
@@ -105,6 +110,30 @@ function remember(k){
   if (SEEN.size > 300) {
     for (const kk of SEEN.keys()) { SEEN.delete(kk); if (SEEN.size <= 200) break; }
   }
+}
+
+// ---------- STRICT sequence state (sig_id -> last seq) ----------
+const SIG_STATE = new Map();         // sig_id -> { lastSeq, ts, symbol }
+const SIG_STATE_TTL_MS = 10 * 60 * 1000;
+
+function cleanupSigState(){
+  const now = Date.now();
+  for (const [k,v] of SIG_STATE) {
+    if (!v || (now - v.ts) > SIG_STATE_TTL_MS) SIG_STATE.delete(k);
+  }
+}
+function getSigState(sig_id){
+  cleanupSigState();
+  const key = String(sig_id||'');
+  if (!key) return null;
+  return SIG_STATE.get(key) || null;
+}
+function setSigState(sig_id, patch){
+  cleanupSigState();
+  const key = String(sig_id||'');
+  if (!key) return;
+  const prev = SIG_STATE.get(key) || { lastSeq: -1, ts: 0, symbol: '' };
+  SIG_STATE.set(key, { ...prev, ...patch, ts: Date.now() });
 }
 
 // ---------- Delta request helper (retries/backoff) ----------
@@ -475,6 +504,12 @@ async function waitUntilFlat(timeoutMs = FLAT_TIMEOUT_MS, pollMs = FLAT_POLL_MS)
 app.get('/health', (_req,res)=>res.json({ok:true, started_at:process.env.__STARTED_AT}));
 app.get('/healthz', (_req,res)=>res.send('ok'));
 app.get('/debug/seen', (_req,res)=>{ res.json({ size: SEEN.size }); });
+app.get('/debug/sigstate', (_req,res)=>{
+  cleanupSigState();
+  const out = {};
+  for (const [k,v] of SIG_STATE) out[k] = v;
+  res.json(out);
+});
 
 // ---------- TradingView webhook ----------
 app.post('/tv', async (req, res) => {
@@ -486,6 +521,11 @@ app.post('/tv', async (req, res) => {
 
     const msg    = (typeof req.body === 'string') ? JSON.parse(req.body) : (req.body || {});
     const action = String(msg.action || '').toUpperCase();
+    const sigId  = String(msg.sig_id || msg.signal_id || '');
+    const seq    = (typeof msg.seq !== 'undefined') ? Number(msg.seq) : NaN;
+    const symTV  = msg.symbol || msg.product_symbol || '';
+    const psym   = toProductSymbol(symTV);
+
     console.log('\n=== INCOMING /tv ===\n', JSON.stringify(msg));
 
     const out = await enqueue('GLOBAL', async () => {
@@ -493,13 +533,28 @@ app.post('/tv', async (req, res) => {
       // ---- idempotency guard ----
       const key = seenKey(msg);
       if (SEEN.has(key)) return { ok:true, dedup:true };
-      remember(key);
+      rememberSeen(key);
 
       // Ignore pure EXIT logs from chart
       if (action === 'EXIT') return { ok:true, ignored:'EXIT' };
 
+      // ---- STRICT SEQUENCE GUARDS (sig_id + seq) ----
+      if (STRICT_SEQUENCE && sigId && Number.isFinite(seq)) {
+        const st = getSigState(sigId) || { lastSeq: -1, symbol: psym };
+        // optional symbol bind (helps if sig_id accidentally reused)
+        if (st.symbol && psym && st.symbol.toUpperCase() !== psym.toUpperCase()) {
+          // new symbol under same sig_id → reset state
+          setSigState(sigId, { lastSeq: -1, symbol: psym });
+        }
+      }
+
       // --------- CANCAL / CANCEL handler (cancel orders + close position(s)) ---------
       if (action === 'CANCAL' || action === 'CANCEL') {
+        // STRICT: expect seq=0 (if provided)
+        if (STRICT_SEQUENCE && sigId && Number.isFinite(seq) && seq !== 0) {
+          return { ok:true, ignored:'CANCAL_seq_mismatch', expected:0, got: seq, sig_id: sigId };
+        }
+
         const doCancelOrders = (typeof msg.cancel_orders === 'undefined') ? true : !!msg.cancel_orders;
         const doClosePos     = (typeof msg.close_position === 'undefined') ? true : !!msg.close_position;
 
@@ -549,6 +604,12 @@ app.post('/tv', async (req, res) => {
         }
 
         const flat = await waitUntilFlat();
+
+        // record strict state
+        if (STRICT_SEQUENCE && sigId) {
+          setSigState(sigId, { lastSeq: 0, symbol: psym });
+        }
+
         return { ok:true, did:'CANCAL', steps, flat };
       }
       // ---------------------------------------------------------------------------
@@ -569,31 +630,73 @@ app.post('/tv', async (req, res) => {
         return { ok:true, step:'bracket', r };
       }
 
-      // Batch (TPs) passthrough — with auto-correct & optional size-normalize
+      // Batch (TPs) passthrough — STRICT: must be BATCH_TPS and seq=2 AND must have ENTER(seq1) already for same sig_id
       if (msg.orders) {
-        // ===== EXTRA SAFETY (3 lines) =====
         if (action !== 'BATCH_TPS') return { ok:true, ignored:'orders_without_BATCH_TPS' };
-        if (Number(msg.seq) !== 2) return { ok:true, ignored:'batch_seq_mismatch', got: msg.seq };
-        // =================================
+        if (Number.isFinite(seq) && seq !== 2) return { ok:true, ignored:'batch_seq_mismatch', expected:2, got: msg.seq };
+
+        if (STRICT_SEQUENCE) {
+          if (!sigId) return { ok:true, ignored:'BATCH_TPS_missing_sig_id' };
+          const st = getSigState(sigId);
+          // must have ENTER registered
+          if (!st || st.lastSeq < 1) {
+            return { ok:true, ignored:'BATCH_TPS_without_ENTER', sig_id: sigId, have: st ? st.lastSeq : null };
+          }
+          // optional: also require lastSeq==1 or >=1; then advance to 2
+        }
+
         const r = await placeBatch(msg);
+
+        if (STRICT_SEQUENCE && sigId) {
+          setSigState(sigId, { lastSeq: 2, symbol: psym });
+        }
+
         return { ok:true, step:'batch', r };
       }
 
       // ENTER / FLIP:
-      // ✅ IMPORTANT: If Pine is sending CANCAL on signal bar, do NOT cancel/close here again.
-      // ✅ But DO gate until flat if require_flat=true (default true).
+      // STRICT: require sig_id + seq=1 AND must have had CANCAL(seq0) for same sig_id (so order is guaranteed)
       if (action === 'ENTER' || action === 'FLIP') {
+
+        if (STRICT_SEQUENCE) {
+          if (!sigId) return { ok:true, ignored:'ENTER_missing_sig_id' };
+          if (Number.isFinite(seq) && seq !== 1) return { ok:true, ignored:'ENTER_seq_mismatch', expected:1, got: msg.seq };
+
+          const st = getSigState(sigId);
+          if (!st || st.lastSeq < 0) {
+            // never saw CANCAL for this sig_id
+            return { ok:true, ignored:'ENTER_without_CANCAL', sig_id: sigId, have: st ? st.lastSeq : null };
+          }
+          if (st.lastSeq >= 1) {
+            // ENTER already processed for this sig_id
+            return { ok:true, ignored:'ENTER_already_seen', sig_id: sigId, have: st.lastSeq };
+          }
+        }
+
+        // ✅ IMPORTANT: If Pine is sending CANCAL on signal bar, do NOT cancel/close here again.
+        // ✅ But DO gate until flat if require_flat=true (default true).
         const requireFlat = (typeof msg.require_flat === 'undefined') ? true : !!msg.require_flat;
         if (requireFlat) {
           const flat = await waitUntilFlat();
           console.log('flat gate result:', flat);
+          // ✅ FIX: actually block entry if not flat
+          if (!flat) return { ok:false, error:'require_flat_timeout', sig_id: sigId };
         }
 
         const r = await placeEntry(msg);
+
+        if (STRICT_SEQUENCE && sigId) {
+          setSigState(sigId, { lastSeq: 1, symbol: psym });
+        }
+
         return { ok:true, step:'entry', r };
       }
 
-      // Fallback: treat as entry
+      // Fallback: treat as entry (you can keep this OFF in strict mode)
+      if (STRICT_SEQUENCE) {
+        return { ok:true, ignored:'unknown_action_in_strict_mode', action, sig_id: sigId, seq: msg.seq };
+      }
+
       const r = await placeEntry(msg);
       return { ok:true, step:'entry', r };
     });
@@ -606,4 +709,4 @@ app.post('/tv', async (req, res) => {
   }
 });
 
-app.listen(PORT, ()=>console.log(`Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE})`));
+app.listen(PORT, ()=>console.log(`Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE})`));
