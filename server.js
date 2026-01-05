@@ -688,10 +688,25 @@ app.post('/tv', async (req, res) => {
 
       // ---- STRICT SEQUENCE SYMBOL BIND (sig_id) ----
       if (STRICT_SEQUENCE && sigId && Number.isFinite(seq)) {
-        const st = getSigState(sigId) || { lastSeq: -1, symbol: psym };
-        if (st.symbol && psym && st.symbol.toUpperCase() !== psym.toUpperCase()) {
+        const st0 = getSigState(sigId) || { lastSeq: -1, symbol: psym };
+        if (st0.symbol && psym && st0.symbol.toUpperCase() !== psym.toUpperCase()) {
           // new symbol under same sig_id → reset state
           setSigState(sigId, { lastSeq: -1, symbol: psym });
+        }
+      }
+
+      // ✅ NEW: STRICT out-of-order / late message guard (prevents late CANCAL closing a fresh ENTER)
+      if (STRICT_SEQUENCE && sigId && Number.isFinite(seq)) {
+        const st = getSigState(sigId);
+        if (st && Number.isFinite(st.lastSeq) && st.lastSeq >= seq) {
+          return {
+            ok: true,
+            ignored: 'out_of_order_or_duplicate_seq',
+            sig_id: sigId,
+            have_lastSeq: st.lastSeq,
+            got_seq: seq,
+            action
+          };
         }
       }
 
@@ -773,8 +788,7 @@ app.post('/tv', async (req, res) => {
           return { ok:true, ignored:'ENTER_already_seen', sig_id: sigId, have: st.lastSeq };
         }
 
-        // ✅ KEY ADDITION:
-        // ENTER can optionally flatten too (cancel_orders + close_position) so a missed CANCAL won't brick flips.
+        // ✅ ENTER can optionally flatten too (cancel_orders + close_position) so a missed CANCAL won't brick flips.
         // Defaults: true unless you explicitly send cancel_orders:false / close_position:false
         const steps = await flattenFromMsg(msg, psym);
 
