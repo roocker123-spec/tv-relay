@@ -1,15 +1,16 @@
 // server.js (FULL) — GLOBAL queue/lock, sig_id+seq idempotency,
 // STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2),
-// BUT: ENTER can self-flatten (cancel_orders+close_position) so missed CANCAL won't brick flips.
+// ENTER can self-recover flips *only when not already flat* (so missed CANCAL won't brick flips),
 // require_flat gating blocks ENTER if flattening not complete,
 // and BATCH_TPS is blocked unless ENTER happened for same sig_id.
 //
-// ✅ ADDITIONS INCLUDED:
+// ✅ INCLUDED:
 // 1) Buffer/queue early BATCH_TPS (seq2 arriving before ENTER) instead of ignoring it.
 // 2) Flush queued BATCH_TPS immediately after ENTER succeeds.
-// 3) ENTER no longer flattens by default (cancel_orders/close_position default to false for ENTER only).
-//
-// NOTE: Still uses GLOBAL queue/lock as you had.
+// 3) ENTER will NOT flatten if already flat; but if require_flat=true and it detects NOT flat,
+//    it will auto-set cancel_orders+close_position to true (unless explicitly provided) to self-recover.
+// 4) STRICT mode requires numeric seq whenever sig_id exists (prevents late CANCAL w/out seq nuking fresh ENTER).
+// 5) Fire-and-forget learnLotMultFromPositions is .catch()’d to avoid unhandled promise rejections.
 
 require('dotenv').config();
 const express = require('express');
@@ -148,7 +149,7 @@ function setSigState(sig_id, patch){
   SIG_STATE.set(key, { ...prev, ...patch, ts: Date.now() });
 }
 
-// ✅ NEW: Pending BATCH buffer (sig_id -> queued batch msg)
+// ✅ Pending BATCH buffer (sig_id -> queued batch msg)
 const PENDING_BATCH = new Map(); // sig_id -> { msg, ts }
 const PENDING_TTL_MS = 60_000;
 
@@ -373,7 +374,9 @@ async function placeEntry(m){
 
   rememberSide(product_symbol, side);
   LAST_ENTRY_SENT.set(product_symbol, { lots: sizeLots, ts: Date.now(), side });
-  learnLotMultFromPositions(product_symbol); // best-effort (no await)
+
+  // ✅ fire-and-forget safely (no unhandled rejection)
+  learnLotMultFromPositions(product_symbol).catch(()=>{});
 
   return out;
 }
@@ -613,6 +616,37 @@ async function waitUntilFlatSymbol(psym, timeoutMs = FLAT_TIMEOUT_MS, pollMs = F
   return false;
 }
 
+// One-shot checks (used to decide whether ENTER should self-flatten)
+async function isFlatNowGlobal(){
+  try {
+    const oo  = await listOpenOrdersAllPages();
+    const hasOrders = oo.some(o => ['open','pending','triggered','untriggered']
+      .includes(String(o?.state||o?.status||'').toLowerCase()));
+    const pos = await listPositionsArray();
+    const hasPos = pos.some(p => Math.abs(Number(p?.size||p?.position_size||0)) > 0);
+    return !hasOrders && !hasPos;
+  } catch {
+    return false;
+  }
+}
+async function isFlatNowSymbol(psym){
+  const sym = toProductSymbol(psym);
+  try {
+    const oo  = await listOpenOrdersAllPages();
+    const mineOrders = oo.filter(o => safeUpper(o?.product_symbol||o?.symbol) === safeUpper(sym));
+    const hasOrders = mineOrders.some(o => ['open','pending','triggered','untriggered']
+      .includes(String(o?.state||o?.status||'').toLowerCase()));
+
+    const pos = await listPositionsArray();
+    const minePos = pos.find(p => safeUpper(p?.product_symbol||p?.symbol) === safeUpper(sym));
+    const hasPos = minePos ? (Math.abs(Number(minePos?.size||minePos?.position_size||0)) > 0) : false;
+
+    return !hasOrders && !hasPos;
+  } catch {
+    return false;
+  }
+}
+
 // Performs flatten: cancel orders + close positions (symbol or all), then optional wait-flat.
 async function flattenFromMsg(msg, psym){
   const scopeAll = isScopeAll(msg);
@@ -724,6 +758,13 @@ app.post('/tv', async (req, res) => {
       // Ignore pure EXIT logs from chart
       if (action === 'EXIT') return { ok:true, ignored:'EXIT' };
 
+      // ✅ STRICT: if sig_id is present, seq must be numeric (prevents seq-less late CANCAL nuking fresh ENTER)
+      if (STRICT_SEQUENCE && sigId) {
+        if (!Number.isFinite(seq)) {
+          return { ok:true, ignored:'missing_or_invalid_seq_in_strict_mode', sig_id: sigId, action };
+        }
+      }
+
       // ---- STRICT SEQUENCE SYMBOL BIND (sig_id) ----
       if (STRICT_SEQUENCE && sigId && Number.isFinite(seq)) {
         const st0 = getSigState(sigId) || { lastSeq: -1, symbol: psym };
@@ -797,7 +838,7 @@ app.post('/tv', async (req, res) => {
           if (!sigId) return { ok:true, ignored:'BATCH_TPS_missing_sig_id' };
           const st = getSigState(sigId);
 
-          // ✅ NEW: If ENTER not done yet, QUEUE the batch instead of dropping it forever.
+          // ✅ If ENTER not done yet, QUEUE the batch instead of dropping it forever.
           if (!st || st.lastSeq < 1) {
             queuePendingBatch(sigId, msg);
             return { ok:true, queued:'BATCH_TPS_waiting_for_ENTER', sig_id: sigId, have: st ? st.lastSeq : null };
@@ -814,7 +855,8 @@ app.post('/tv', async (req, res) => {
       }
 
       // ENTER / FLIP:
-      // STRICT: prefer seq=1 (if provided). ENTER is allowed even if CANCAL missing (self-flatten can recover).
+      // STRICT: prefer seq=1 (if provided). ENTER is allowed even if CANCAL missing
+      // because it can self-recover *only if it detects not-flat*.
       if (action === 'ENTER' || action === 'FLIP') {
 
         if (STRICT_SEQUENCE) {
@@ -829,17 +871,28 @@ app.post('/tv', async (req, res) => {
           return { ok:true, ignored:'ENTER_already_seen', sig_id: sigId, have: st.lastSeq };
         }
 
-        // ✅ NEW: ENTER should NOT flatten by default (prevents nuking TP ladders / other orders).
-        // If you want ENTER to flatten, explicitly send cancel_orders:true and/or close_position:true.
-        if (typeof msg.cancel_orders === 'undefined') msg.cancel_orders = false;
-        if (typeof msg.close_position === 'undefined') msg.close_position = false;
+        // require_flat gating (default true)
+        const requireFlat = (typeof msg.require_flat === 'undefined') ? true : !!msg.require_flat;
+
+        // ✅ Decide whether ENTER should self-flatten:
+        // - If user explicitly sets cancel_orders/close_position, respect it.
+        // - Else, if require_flat=true:
+        //     * if already flat -> default no flatten (protect existing ladders)
+        //     * if not flat -> default flatten (self-recover if CANCAL missed)
         if (typeof msg.cancel_orders_scope === 'undefined') msg.cancel_orders_scope = 'SYMBOL';
 
-        // ENTER can optionally flatten too (if you explicitly set flags true).
+        let flatNow = true;
+        if (requireFlat) {
+          flatNow = isScopeAll(msg) ? await isFlatNowGlobal() : await isFlatNowSymbol(psym);
+        }
+
+        if (typeof msg.cancel_orders === 'undefined') msg.cancel_orders = requireFlat ? (!flatNow) : false;
+        if (typeof msg.close_position === 'undefined') msg.close_position = requireFlat ? (!flatNow) : false;
+
+        // Perform flatten if enabled
         const steps = await flattenFromMsg(msg, psym);
 
-        // ✅ require_flat gating (default true): actually block entry if not flat.
-        const requireFlat = (typeof msg.require_flat === 'undefined') ? true : !!msg.require_flat;
+        // Gate until flat if required
         if (requireFlat) {
           const flat = isScopeAll(msg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
           console.log('flat gate result:', flat);
@@ -852,7 +905,7 @@ app.post('/tv', async (req, res) => {
           setSigState(sigId, { lastSeq: 1, symbol: psym });
         }
 
-        // ✅ NEW: If a BATCH_TPS was queued early, flush it right after a successful ENTER.
+        // ✅ If a BATCH_TPS was queued early, flush it right after a successful ENTER.
         let batch = null;
         let batch_error = null;
         const pendingMsg = STRICT_SEQUENCE && sigId ? takePendingBatch(sigId) : null;
@@ -867,10 +920,12 @@ app.post('/tv', async (req, res) => {
 
         // Helpful flag if we recovered without having seen CANCAL
         const recovered = (STRICT_SEQUENCE && st && st.lastSeq < 0);
+
         return {
           ok:true,
           step: pendingMsg ? 'entry+batch' : 'entry',
           recovered_without_cancal: !!recovered,
+          self_flattened: requireFlat ? (!flatNow) : false,
           steps,
           r,
           batch,
