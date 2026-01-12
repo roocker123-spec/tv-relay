@@ -1,8 +1,15 @@
 // server.js (FULL) — GLOBAL queue/lock, sig_id+seq idempotency,
 // STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2),
 // BUT: ENTER can self-flatten (cancel_orders+close_position) so missed CANCAL won't brick flips.
-// require_flat gating actually blocks ENTER if flattening not complete,
+// require_flat gating blocks ENTER if flattening not complete,
 // and BATCH_TPS is blocked unless ENTER happened for same sig_id.
+//
+// ✅ ADDITIONS INCLUDED:
+// 1) Buffer/queue early BATCH_TPS (seq2 arriving before ENTER) instead of ignoring it.
+// 2) Flush queued BATCH_TPS immediately after ENTER succeeds.
+// 3) ENTER no longer flattens by default (cancel_orders/close_position default to false for ENTER only).
+//
+// NOTE: Still uses GLOBAL queue/lock as you had.
 
 require('dotenv').config();
 const express = require('express');
@@ -139,6 +146,31 @@ function setSigState(sig_id, patch){
   if (!key) return;
   const prev = SIG_STATE.get(key) || { lastSeq: -1, ts: 0, symbol: '' };
   SIG_STATE.set(key, { ...prev, ...patch, ts: Date.now() });
+}
+
+// ✅ NEW: Pending BATCH buffer (sig_id -> queued batch msg)
+const PENDING_BATCH = new Map(); // sig_id -> { msg, ts }
+const PENDING_TTL_MS = 60_000;
+
+function cleanupPendingBatch(){
+  const now = Date.now();
+  for (const [k,v] of PENDING_BATCH) {
+    if (!v || (now - v.ts) > PENDING_TTL_MS) PENDING_BATCH.delete(k);
+  }
+}
+function queuePendingBatch(sigId, msg){
+  cleanupPendingBatch();
+  if (!sigId) return false;
+  PENDING_BATCH.set(String(sigId), { msg, ts: Date.now() });
+  return true;
+}
+function takePendingBatch(sigId){
+  cleanupPendingBatch();
+  if (!sigId) return null;
+  const key = String(sigId);
+  const v = PENDING_BATCH.get(key) || null;
+  if (v) PENDING_BATCH.delete(key);
+  return v?.msg || null;
 }
 
 // ---------- Delta request helper (retries/backoff) ----------
@@ -658,6 +690,12 @@ app.get('/debug/sigstate', (_req,res)=>{
   for (const [k,v] of SIG_STATE) out[k] = v;
   res.json(out);
 });
+app.get('/debug/pending_batch', (_req,res)=>{
+  cleanupPendingBatch();
+  const out = {};
+  for (const [k,v] of PENDING_BATCH) out[k] = { ts: v.ts, action: v?.msg?.action, symbol: v?.msg?.product_symbol || v?.msg?.symbol };
+  res.json({ size: PENDING_BATCH.size, items: out });
+});
 
 // ---------- TradingView webhook ----------
 app.post('/tv', async (req, res) => {
@@ -695,7 +733,7 @@ app.post('/tv', async (req, res) => {
         }
       }
 
-      // ✅ NEW: STRICT out-of-order / late message guard (prevents late CANCAL closing a fresh ENTER)
+      // ✅ STRICT out-of-order / late message guard (prevents late CANCAL closing a fresh ENTER)
       if (STRICT_SEQUENCE && sigId && Number.isFinite(seq)) {
         const st = getSigState(sigId);
         if (st && Number.isFinite(st.lastSeq) && st.lastSeq >= seq) {
@@ -758,8 +796,11 @@ app.post('/tv', async (req, res) => {
         if (STRICT_SEQUENCE) {
           if (!sigId) return { ok:true, ignored:'BATCH_TPS_missing_sig_id' };
           const st = getSigState(sigId);
+
+          // ✅ NEW: If ENTER not done yet, QUEUE the batch instead of dropping it forever.
           if (!st || st.lastSeq < 1) {
-            return { ok:true, ignored:'BATCH_TPS_without_ENTER', sig_id: sigId, have: st ? st.lastSeq : null };
+            queuePendingBatch(sigId, msg);
+            return { ok:true, queued:'BATCH_TPS_waiting_for_ENTER', sig_id: sigId, have: st ? st.lastSeq : null };
           }
         }
 
@@ -788,8 +829,13 @@ app.post('/tv', async (req, res) => {
           return { ok:true, ignored:'ENTER_already_seen', sig_id: sigId, have: st.lastSeq };
         }
 
-        // ✅ ENTER can optionally flatten too (cancel_orders + close_position) so a missed CANCAL won't brick flips.
-        // Defaults: true unless you explicitly send cancel_orders:false / close_position:false
+        // ✅ NEW: ENTER should NOT flatten by default (prevents nuking TP ladders / other orders).
+        // If you want ENTER to flatten, explicitly send cancel_orders:true and/or close_position:true.
+        if (typeof msg.cancel_orders === 'undefined') msg.cancel_orders = false;
+        if (typeof msg.close_position === 'undefined') msg.close_position = false;
+        if (typeof msg.cancel_orders_scope === 'undefined') msg.cancel_orders_scope = 'SYMBOL';
+
+        // ENTER can optionally flatten too (if you explicitly set flags true).
         const steps = await flattenFromMsg(msg, psym);
 
         // ✅ require_flat gating (default true): actually block entry if not flat.
@@ -806,9 +852,30 @@ app.post('/tv', async (req, res) => {
           setSigState(sigId, { lastSeq: 1, symbol: psym });
         }
 
+        // ✅ NEW: If a BATCH_TPS was queued early, flush it right after a successful ENTER.
+        let batch = null;
+        let batch_error = null;
+        const pendingMsg = STRICT_SEQUENCE && sigId ? takePendingBatch(sigId) : null;
+        if (pendingMsg) {
+          try {
+            batch = await placeBatch(pendingMsg);
+            if (STRICT_SEQUENCE && sigId) setSigState(sigId, { lastSeq: 2, symbol: psym });
+          } catch (e) {
+            batch_error = String(e?.message || e);
+          }
+        }
+
         // Helpful flag if we recovered without having seen CANCAL
         const recovered = (STRICT_SEQUENCE && st && st.lastSeq < 0);
-        return { ok:true, step:'entry', recovered_without_cancal: !!recovered, steps, r };
+        return {
+          ok:true,
+          step: pendingMsg ? 'entry+batch' : 'entry',
+          recovered_without_cancal: !!recovered,
+          steps,
+          r,
+          batch,
+          batch_error
+        };
       }
 
       // Fallback: treat as entry (you can keep this OFF in strict mode)
