@@ -1,12 +1,16 @@
-// server.js (FULL) — SIMPLE / NO STRICT SEQUENCING
-// Behavior:
-// - CANCAL/CANCEL: cancel orders + close positions (ALL by default) + waitUntilFlat
-// - ENTER/FLIP:    same flatten first + waitUntilFlat + then market entry
-// - BATCH_TPS:     just forwards to /v2/orders/batch (no gating)
+// server.js (FULL) — GLOBAL queue/lock, sig_id+seq idempotency,
+// STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2),
+// ENTER can self-recover flips *only when not already flat* (so missed CANCAL won't brick flips),
+// require_flat gating blocks ENTER if flattening not complete,
+// and BATCH_TPS is blocked unless ENTER happened for same sig_id.
 //
-// Notes:
-// - No sig_id/seq gating (STRICT removed)
-// - Still has GLOBAL queue lock + idempotency (drops exact dupes ~60s)
+// ✅ INCLUDED:
+// 1) Buffer/queue early BATCH_TPS (seq2 arriving before ENTER) instead of ignoring it.
+// 2) Flush queued BATCH_TPS immediately after ENTER succeeds.
+// 3) ENTER will NOT flatten if already flat; but if require_flat=true and it detects NOT flat,
+//    it will auto-set cancel_orders+close_position to true (unless explicitly provided) to self-recover.
+// 4) STRICT mode requires numeric seq whenever sig_id exists (prevents late CANCAL w/out seq nuking fresh ENTER).
+// 5) Fire-and-forget learnLotMultFromPositions is .catch()’d to avoid unhandled promise rejections.
 
 require('dotenv').config();
 const express = require('express');
@@ -18,18 +22,16 @@ function nowTsSec(){ return Math.floor(Date.now()/1000).toString(); }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 function clamp(n,min,max){ return Math.min(Math.max(n,min),max); }
 function nnum(x, d=0){ const n = Number(x); return Number.isFinite(n) ? n : d; }
-function safeUpper(x){ return String(x||'').toUpperCase(); }
-
 function toProductSymbol(sym){
   if(!sym) return sym;
   let s = String(sym).replace('.P','');           // remove TradingView .P suffix if present
   if(s.includes(':')) s = s.split(':').pop();     // remove prefix like BINANCE:
   return s;
 }
-
 function isScopeAll(msg){
   return String(msg.scope||'').toUpperCase() === 'ALL' || !!msg.close_all;
 }
+function safeUpper(x){ return String(x||'').toUpperCase(); }
 
 // ---------- global queue (serializes webhook execution) ----------
 const QUEUE = new Map(); // key -> Promise chain
@@ -88,11 +90,17 @@ const MAX_LOTS_PER_ORDER = nnum(process.env.MAX_LOTS_PER_ORDER, 200000);
 const FLAT_TIMEOUT_MS    = nnum(process.env.FLAT_TIMEOUT_MS, 15000);
 const FLAT_POLL_MS       = nnum(process.env.FLAT_POLL_MS, 400);
 
+// ---------- STRICT sequence (default ON) ----------
+const STRICT_SEQUENCE = String(process.env.STRICT_SEQUENCE || 'true').toLowerCase() !== 'false';
+
 // ---------- idempotency (drops dupes ~60s) ----------
 const SEEN = new Map();              // key -> ts(ms)
 const SEEN_TTL_MS = 60_000;
 
+// ✅ includes sig_id + seq
 function seenKey(msg){
+  const sig = String(msg.sig_id || msg.signal_id || '');
+  const seq = String(msg.seq ?? '');
   const p = [
     String(msg.action||''),
     String(msg.product_symbol||msg.symbol||''),
@@ -100,10 +108,9 @@ function seenKey(msg){
     String(msg.qty||''),
     String(msg.entry||''),
     String(msg.strategy_id||''),
-    String(msg.sig_id||msg.signal_id||''),
-    String(msg.seq ?? ''),
-    String(msg.amount||msg.amount_inr||msg.amount_usd||msg.order_amount||''),
-    JSON.stringify(msg.orders || null)
+    sig,
+    seq,
+    String(msg.amount||msg.amount_inr||msg.amount_usd||msg.order_amount||'')
   ].join('|');
   return crypto.createHash('sha1').update(p).digest('hex');
 }
@@ -116,6 +123,55 @@ function rememberSeen(k){
   if (SEEN.size > 300) {
     for (const kk of SEEN.keys()) { SEEN.delete(kk); if (SEEN.size <= 200) break; }
   }
+}
+
+// ---------- STRICT sequence state (sig_id -> last seq) ----------
+const SIG_STATE = new Map();         // sig_id -> { lastSeq, ts, symbol }
+const SIG_STATE_TTL_MS = 10 * 60 * 1000;
+
+function cleanupSigState(){
+  const now = Date.now();
+  for (const [k,v] of SIG_STATE) {
+    if (!v || (now - v.ts) > SIG_STATE_TTL_MS) SIG_STATE.delete(k);
+  }
+}
+function getSigState(sig_id){
+  cleanupSigState();
+  const key = String(sig_id||'');
+  if (!key) return null;
+  return SIG_STATE.get(key) || null;
+}
+function setSigState(sig_id, patch){
+  cleanupSigState();
+  const key = String(sig_id||'');
+  if (!key) return;
+  const prev = SIG_STATE.get(key) || { lastSeq: -1, ts: 0, symbol: '' };
+  SIG_STATE.set(key, { ...prev, ...patch, ts: Date.now() });
+}
+
+// ✅ Pending BATCH buffer (sig_id -> queued batch msg)
+const PENDING_BATCH = new Map(); // sig_id -> { msg, ts }
+const PENDING_TTL_MS = 60_000;
+
+function cleanupPendingBatch(){
+  const now = Date.now();
+  for (const [k,v] of PENDING_BATCH) {
+    if (!v || (now - v.ts) > PENDING_TTL_MS) PENDING_BATCH.delete(k);
+  }
+}
+function queuePendingBatch(sigId, msg){
+  cleanupPendingBatch();
+  if (!sigId) return false;
+  PENDING_BATCH.set(String(sigId), { msg, ts: Date.now() });
+  return true;
+}
+function takePendingBatch(sigId){
+  cleanupPendingBatch();
+  if (!sigId) return null;
+  const key = String(sigId);
+  const v = PENDING_BATCH.get(key) || null;
+  if (v) PENDING_BATCH.delete(key);
+  return v?.msg || null;
 }
 
 // ---------- Delta request helper (retries/backoff) ----------
@@ -189,6 +245,7 @@ app.get('/debug/lotcache', (_req,res)=>{
   res.json(o);
 });
 
+// Try to infer multiplier from meta fields (robust, no hardcode)
 function lotMultiplierFromMeta(meta){
   const cand = [
     meta?.contract_value,
@@ -245,26 +302,6 @@ function oppositeSide(side){ return (String(side||'').toLowerCase()==='buy') ? '
 
 // ---------- learning: coins-per-lot from actual position ----------
 const LAST_ENTRY_SENT = new Map(); // psym -> { lots, ts, side }
-async function listPositionsArray(){
-  try {
-    const pos = await dcall('GET','/v2/positions');
-    const arr = Array.isArray(pos?.result?.positions) ? pos.result.positions
-              : Array.isArray(pos?.result) ? pos.result
-              : Array.isArray(pos?.positions) ? pos.positions
-              : Array.isArray(pos) ? pos : [];
-    if (arr.length || pos?.success !== false) return arr;
-  } catch(e) {}
-  try {
-    const pos2 = await dcall('GET','/v2/positions/margined');
-    const arr2 = Array.isArray(pos2?.result?.positions) ? pos2.result.positions
-               : Array.isArray(pos2?.result) ? pos2.result
-               : Array.isArray(pos2?.positions) ? pos2.positions
-               : Array.isArray(pos2) ? pos2 : [];
-    if (arr2.length) return arr2;
-  } catch(e) {}
-  return [];
-}
-
 async function learnLotMultFromPositions(psym){
   const last = LAST_ENTRY_SENT.get(psym);
   if (!last || (Date.now()-last.ts) > 15_000) return;
@@ -338,7 +375,7 @@ async function placeEntry(m){
   rememberSide(product_symbol, side);
   LAST_ENTRY_SENT.set(product_symbol, { lots: sizeLots, ts: Date.now(), side });
 
-  // fire-and-forget safely (no unhandled rejection)
+  // ✅ fire-and-forget safely (no unhandled rejection)
   learnLotMultFromPositions(product_symbol).catch(()=>{});
 
   return out;
@@ -355,7 +392,6 @@ async function placeBatch(m){
   const body = { ...bodyIn };
   if(!body.product_symbol && !body.product_id) body.product_symbol = toProductSymbol(m.product_symbol || m.symbol);
 
-  // optional: try to fix TP sides + size normalization
   try {
     const psym = body.product_symbol;
     const last = LAST_SIDE.get(psym);
@@ -376,19 +412,15 @@ async function placeBatch(m){
         const coins = nnum(oo.size_coins ?? oo.coins, 0);
         if (coins > 0) oo.size = Math.max(1, Math.floor(coins / lotMult));
 
-        // If size looks like coins, normalize
+        // If size looks suspiciously like coins (very large and divisible), normalize
         if (!coins && nnum(oo.size,0) > lotMult && Math.abs(nnum(oo.size,0) / lotMult - Math.round(nnum(oo.size,0) / lotMult)) < 1e-6) {
           oo.size = Math.max(1, Math.floor(nnum(oo.size,0) / lotMult));
         }
 
-        // auto-correct TP side to opposite of last entry
         if (last && (!oo.side || String(oo.side).toLowerCase() === last)) {
           oo.side = oppositeSide(last);
         }
-
-        // make reduce-only by default (safer TPs)
         if (typeof oo.reduce_only === 'undefined') oo.reduce_only = true;
-
         return oo;
       });
     }
@@ -402,6 +434,52 @@ async function placeBatch(m){
 // ---------- CANCEL/CLOSE + listings ----------
 const cancelAllOrders   = () => dcall('DELETE','/v2/orders/all');
 const closeAllPositions = () => dcall('POST','/v2/positions/close_all', {});
+
+// Try symbol-scoped cancel (preferred if you trade multiple symbols)
+// If Delta endpoint differs, it will fail harmlessly and we can optionally fallback to cancelAllOrders.
+async function cancelOrderById(orderId){
+  if (!orderId) return { ok:true, skipped:true, reason:'missing_order_id' };
+  return dcall('DELETE', `/v2/orders/${orderId}`);
+}
+async function cancelOrdersBySymbol(psym, { fallbackAll=false } = {}){
+  const sym = toProductSymbol(psym);
+  if (!sym) return { ok:true, skipped:true, reason:'missing_symbol' };
+
+  let open = [];
+  try {
+    open = await listOpenOrdersAllPages();
+  } catch(e) {
+    if (fallbackAll) {
+      await cancelAllOrders();
+      return { ok:true, fallback:'cancel_all_orders' };
+    }
+    throw e;
+  }
+
+  const mine = open.filter(o => safeUpper(o?.product_symbol||o?.symbol) === safeUpper(sym));
+  if (!mine.length) {
+    return { ok:true, skipped:true, reason:'no_open_orders_for_symbol', symbol: sym };
+  }
+
+  let cancelled = 0, failed = 0;
+  for (const o of mine){
+    const oid = o?.id || o?.order_id;
+    try {
+      await cancelOrderById(oid);
+      cancelled++;
+    } catch(e){
+      failed++;
+      console.warn('cancelOrdersBySymbol: cancel failed', { symbol: sym, oid, err: e?.message || e });
+    }
+  }
+
+  if (failed && fallbackAll) {
+    await cancelAllOrders();
+    return { ok:true, cancelled, failed, fallback:'cancel_all_orders' };
+  }
+
+  return { ok:true, cancelled, failed, symbol: sym };
+}
 
 // List helpers
 async function listOpenOrdersAllPages(){
@@ -420,6 +498,66 @@ async function listOpenOrdersAllPages(){
   return all;
 }
 
+async function listPositionsArray(){
+  try {
+    const pos = await dcall('GET','/v2/positions');
+    const arr = Array.isArray(pos?.result?.positions) ? pos.result.positions
+              : Array.isArray(pos?.result) ? pos.result
+              : Array.isArray(pos?.positions) ? pos.positions
+              : Array.isArray(pos) ? pos : [];
+    if (arr.length || pos?.success !== false) return arr;
+  } catch(e) {}
+  try {
+    const pos2 = await dcall('GET','/v2/positions/margined');
+    const arr2 = Array.isArray(pos2?.result?.positions) ? pos2.result.positions
+               : Array.isArray(pos2?.result) ? pos2.result
+               : Array.isArray(pos2?.positions) ? pos2.positions
+               : Array.isArray(pos2) ? pos2 : [];
+    if (arr2.length) return arr2;
+  } catch(e) {}
+  return [];
+}
+
+// Close ONLY the symbol from webhook by sending a reduce-only market order
+async function closePositionBySymbol(symbolOrProductSymbol){
+  const psym = toProductSymbol(symbolOrProductSymbol);
+  if (!psym) throw new Error('closePositionBySymbol: missing symbol/product_symbol');
+
+  const pos = await listPositionsArray();
+  const row = pos.find(p =>
+    safeUpper(p?.product_symbol || p?.symbol) === safeUpper(psym)
+  );
+
+  const sizeCoins = Number(row?.size || row?.position_size || 0);
+  if (!sizeCoins || Math.abs(sizeCoins) < 1e-12) {
+    console.log('closePositionBySymbol: no open position for', psym);
+    return { ok:true, skipped:true, reason:'no_position' };
+  }
+
+  // lot multiplier from cache or meta
+  let lotMult = getCachedLotMult(psym);
+  if (!lotMult) {
+    const meta = await getProductMeta(psym);
+    lotMult = lotMultiplierFromMeta(meta);
+    setCachedLotMult(psym, lotMult);
+  }
+
+  const absCoins = Math.abs(sizeCoins);
+  // Use CEIL so we don't leave a tiny remainder; reduce_only prevents flipping/opening extra
+  const lots = Math.max(1, Math.ceil((absCoins / lotMult) - 1e-12));
+  const side = sizeCoins > 0 ? 'sell' : 'buy';
+
+  console.log('closePositionBySymbol:', { psym, sizeCoins, lotMult, lots, side });
+
+  return dcall('POST','/v2/orders',{
+    product_symbol: psym,
+    order_type: 'market_order',
+    side,
+    size: lots,
+    reduce_only: true
+  });
+}
+
 // Gate until there are no open orders and no positions (GLOBAL).
 async function waitUntilFlat(timeoutMs = FLAT_TIMEOUT_MS, pollMs = FLAT_POLL_MS) {
   const end = Date.now() + timeoutMs;
@@ -428,10 +566,8 @@ async function waitUntilFlat(timeoutMs = FLAT_TIMEOUT_MS, pollMs = FLAT_POLL_MS)
       const oo  = await listOpenOrdersAllPages();
       const hasOrders = oo.some(o => ['open','pending','triggered','untriggered']
         .includes(String(o?.state||o?.status||'').toLowerCase()));
-
       const pos = await listPositionsArray();
       const hasPos = pos.some(p => Math.abs(Number(p?.size||p?.position_size||0)) > 0);
-
       if (!hasOrders && !hasPos) return true;
 
       console.log('…still flattening (GLOBAL)', {
@@ -450,22 +586,150 @@ async function waitUntilFlat(timeoutMs = FLAT_TIMEOUT_MS, pollMs = FLAT_POLL_MS)
   return false;
 }
 
-// Simple flatten:
-// - default is GLOBAL (cancel all + close all)
-// - if msg.scope=ALL or close_all true => GLOBAL
-async function simpleFlatten(msg){
-  // For "simple", we do global flatten always.
-  // If you ever want symbol-only later, tell me and I’ll switch it.
-  await cancelAllOrders();
-  await closeAllPositions();
-  const flat = await waitUntilFlat();
-  return flat;
+// Gate until there are no open orders and no position for ONE SYMBOL.
+async function waitUntilFlatSymbol(psym, timeoutMs = FLAT_TIMEOUT_MS, pollMs = FLAT_POLL_MS) {
+  const sym = toProductSymbol(psym);
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    try {
+      const oo  = await listOpenOrdersAllPages();
+      const mineOrders = oo.filter(o => safeUpper(o?.product_symbol||o?.symbol) === safeUpper(sym));
+      const hasOrders = mineOrders.some(o => ['open','pending','triggered','untriggered']
+        .includes(String(o?.state||o?.status||'').toLowerCase()));
+
+      const pos = await listPositionsArray();
+      const minePos = pos.find(p => safeUpper(p?.product_symbol||p?.symbol) === safeUpper(sym));
+      const hasPos = minePos ? (Math.abs(Number(minePos?.size||minePos?.position_size||0)) > 0) : false;
+
+      if (!hasOrders && !hasPos) return true;
+
+      console.log('…still flattening (SYMBOL)', {
+        symbol: sym,
+        openOrders: mineOrders.length,
+        position: minePos ? { size: minePos.size || minePos.position_size } : null
+      });
+    } catch(e) {
+      console.warn('waitUntilFlatSymbol poll error (ignoring):', e?.message || e);
+    }
+    await sleep(pollMs);
+  }
+  return false;
+}
+
+// One-shot checks (used to decide whether ENTER should self-flatten)
+async function isFlatNowGlobal(){
+  try {
+    const oo  = await listOpenOrdersAllPages();
+    const hasOrders = oo.some(o => ['open','pending','triggered','untriggered']
+      .includes(String(o?.state||o?.status||'').toLowerCase()));
+    const pos = await listPositionsArray();
+    const hasPos = pos.some(p => Math.abs(Number(p?.size||p?.position_size||0)) > 0);
+    return !hasOrders && !hasPos;
+  } catch {
+    return false;
+  }
+}
+async function isFlatNowSymbol(psym){
+  const sym = toProductSymbol(psym);
+  try {
+    const oo  = await listOpenOrdersAllPages();
+    const mineOrders = oo.filter(o => safeUpper(o?.product_symbol||o?.symbol) === safeUpper(sym));
+    const hasOrders = mineOrders.some(o => ['open','pending','triggered','untriggered']
+      .includes(String(o?.state||o?.status||'').toLowerCase()));
+
+    const pos = await listPositionsArray();
+    const minePos = pos.find(p => safeUpper(p?.product_symbol||p?.symbol) === safeUpper(sym));
+    const hasPos = minePos ? (Math.abs(Number(minePos?.size||minePos?.position_size||0)) > 0) : false;
+
+    return !hasOrders && !hasPos;
+  } catch {
+    return false;
+  }
+}
+
+// Performs flatten: cancel orders + close positions (symbol or all), then optional wait-flat.
+async function flattenFromMsg(msg, psym){
+  const scopeAll = isScopeAll(msg);
+
+  const doCancelOrders = (typeof msg.cancel_orders === 'undefined') ? true : !!msg.cancel_orders;
+  const doClosePos     = (typeof msg.close_position === 'undefined') ? true : !!msg.close_position;
+
+  // If you want strict safety for multi-symbol accounts:
+  // - send msg.cancel_orders_scope="SYMBOL" to avoid cancelling everything.
+  const cancelScope = String(msg.cancel_orders_scope || '').toUpperCase(); // "SYMBOL" | "" (default)
+  const cancelFallbackAll = !!msg.cancel_fallback_all;
+
+  const steps = {
+    cancel_orders: false,
+    close_position: false,
+    cancel_mode: null,
+    close_mode: null,
+    cancel_error: null,
+    close_error: null
+  };
+
+  if (doCancelOrders) {
+    try {
+      if (scopeAll) {
+        await cancelAllOrders();
+        steps.cancel_mode = 'cancel_all_orders';
+      } else if (cancelScope === 'SYMBOL') {
+        await cancelOrdersBySymbol(psym, { fallbackAll: cancelFallbackAll });
+        steps.cancel_mode = 'cancel_symbol_orders';
+      } else {
+        // default behavior (single-symbol users): cancel all orders
+        await cancelAllOrders();
+        steps.cancel_mode = 'cancel_all_orders';
+      }
+      steps.cancel_orders = true;
+    } catch (e) {
+      steps.cancel_error = String(e?.message || e);
+      console.warn('flatten cancel failed:', e?.message || e);
+    }
+  }
+
+  if (doClosePos) {
+    try {
+      if (scopeAll) {
+        await closeAllPositions();
+        steps.close_mode = 'close_all_positions';
+      } else {
+        // Prefer closing ONLY the symbol you sent
+        const sym = msg.symbol || msg.product_symbol || psym;
+        if (sym) {
+          await closePositionBySymbol(sym);
+          steps.close_mode = 'close_by_symbol';
+        } else {
+          await closeAllPositions();
+          steps.close_mode = 'close_all_positions';
+        }
+      }
+      steps.close_position = true;
+    } catch (e) {
+      steps.close_error = String(e?.message || e);
+      console.warn('flatten close failed:', e?.message || e);
+    }
+  }
+
+  return steps;
 }
 
 // ---------- health ----------
 app.get('/health', (_req,res)=>res.json({ok:true, started_at:process.env.__STARTED_AT}));
 app.get('/healthz', (_req,res)=>res.send('ok'));
 app.get('/debug/seen', (_req,res)=>{ res.json({ size: SEEN.size }); });
+app.get('/debug/sigstate', (_req,res)=>{
+  cleanupSigState();
+  const out = {};
+  for (const [k,v] of SIG_STATE) out[k] = v;
+  res.json(out);
+});
+app.get('/debug/pending_batch', (_req,res)=>{
+  cleanupPendingBatch();
+  const out = {};
+  for (const [k,v] of PENDING_BATCH) out[k] = { ts: v.ts, action: v?.msg?.action, symbol: v?.msg?.product_symbol || v?.msg?.symbol };
+  res.json({ size: PENDING_BATCH.size, items: out });
+});
 
 // ---------- TradingView webhook ----------
 app.post('/tv', async (req, res) => {
@@ -477,6 +741,10 @@ app.post('/tv', async (req, res) => {
 
     const msg    = (typeof req.body === 'string') ? JSON.parse(req.body) : (req.body || {});
     const action = String(msg.action || '').toUpperCase();
+    const sigId  = String(msg.sig_id || msg.signal_id || '');
+    const seq    = (typeof msg.seq !== 'undefined') ? Number(msg.seq) : NaN;
+    const symTV  = msg.symbol || msg.product_symbol || '';
+    const psym   = toProductSymbol(symTV);
 
     console.log('\n=== INCOMING /tv ===\n', JSON.stringify(msg));
 
@@ -490,44 +758,188 @@ app.post('/tv', async (req, res) => {
       // Ignore pure EXIT logs from chart
       if (action === 'EXIT') return { ok:true, ignored:'EXIT' };
 
-      // Bracket passthrough (optional)
+      // ✅ STRICT: if sig_id is present, seq must be numeric (prevents seq-less late CANCAL nuking fresh ENTER)
+      if (STRICT_SEQUENCE && sigId) {
+        if (!Number.isFinite(seq)) {
+          return { ok:true, ignored:'missing_or_invalid_seq_in_strict_mode', sig_id: sigId, action };
+        }
+      }
+
+      // ---- STRICT SEQUENCE SYMBOL BIND (sig_id) ----
+      if (STRICT_SEQUENCE && sigId && Number.isFinite(seq)) {
+        const st0 = getSigState(sigId) || { lastSeq: -1, symbol: psym };
+        if (st0.symbol && psym && st0.symbol.toUpperCase() !== psym.toUpperCase()) {
+          // new symbol under same sig_id → reset state
+          setSigState(sigId, { lastSeq: -1, symbol: psym });
+        }
+      }
+
+      // ✅ STRICT out-of-order / late message guard (prevents late CANCAL closing a fresh ENTER)
+      if (STRICT_SEQUENCE && sigId && Number.isFinite(seq)) {
+        const st = getSigState(sigId);
+        if (st && Number.isFinite(st.lastSeq) && st.lastSeq >= seq) {
+          return {
+            ok: true,
+            ignored: 'out_of_order_or_duplicate_seq',
+            sig_id: sigId,
+            have_lastSeq: st.lastSeq,
+            got_seq: seq,
+            action
+          };
+        }
+      }
+
+      // --------- CANCAL / CANCEL handler (cancel orders + close position(s)) ---------
+      if (action === 'CANCAL' || action === 'CANCEL') {
+        // STRICT: expect seq=0 (if provided)
+        if (STRICT_SEQUENCE && sigId && Number.isFinite(seq) && seq !== 0) {
+          return { ok:true, ignored:'CANCAL_seq_mismatch', expected:0, got: seq, sig_id: sigId };
+        }
+
+        const steps = await flattenFromMsg(msg, psym);
+
+        // default require_flat true
+        const requireFlat = (typeof msg.require_flat === 'undefined') ? true : !!msg.require_flat;
+        let flat = true;
+        if (requireFlat) {
+          flat = isScopeAll(msg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
+        }
+
+        if (STRICT_SEQUENCE && sigId) {
+          setSigState(sigId, { lastSeq: 0, symbol: psym });
+        }
+
+        return { ok:true, did:'CANCAL', steps, flat };
+      }
+      // ---------------------------------------------------------------------------
+
+      // Explicit cleanup from Pine (still supported)
+      if (action === 'DELTA_CANCEL_ALL' || action === 'CANCEL_ALL') {
+        const out = await cancelAllOrders();
+        return { ok:true, did:'cancel_all_orders', delta: out };
+      }
+      if (action === 'CLOSE_POSITION') {
+        const out = await closeAllPositions();
+        return { ok:true, did:'close_all_positions', delta: out };
+      }
+
+      // Bracket passthrough
       if (msg.stop_loss_order || msg.take_profit_order) {
         const r = await placeBracket(msg);
         return { ok:true, step:'bracket', r };
       }
 
-      // Batch (TPs)
+      // Batch (TPs) passthrough — STRICT: must be BATCH_TPS and seq=2 AND must have ENTER(seq1) already for same sig_id
       if (msg.orders) {
+        if (action !== 'BATCH_TPS') return { ok:true, ignored:'orders_without_BATCH_TPS' };
+        if (Number.isFinite(seq) && seq !== 2) return { ok:true, ignored:'batch_seq_mismatch', expected:2, got: msg.seq };
+
+        if (STRICT_SEQUENCE) {
+          if (!sigId) return { ok:true, ignored:'BATCH_TPS_missing_sig_id' };
+          const st = getSigState(sigId);
+
+          // ✅ If ENTER not done yet, QUEUE the batch instead of dropping it forever.
+          if (!st || st.lastSeq < 1) {
+            queuePendingBatch(sigId, msg);
+            return { ok:true, queued:'BATCH_TPS_waiting_for_ENTER', sig_id: sigId, have: st ? st.lastSeq : null };
+          }
+        }
+
         const r = await placeBatch(msg);
+
+        if (STRICT_SEQUENCE && sigId) {
+          setSigState(sigId, { lastSeq: 2, symbol: psym });
+        }
+
         return { ok:true, step:'batch', r };
       }
 
-      // CANCAL / CANCEL (flatten)
-      if (action === 'CANCAL' || action === 'CANCEL') {
-        const flat = await simpleFlatten(msg);
-        return { ok:true, did:'CANCAL', flat };
-      }
-
-      // ENTER / FLIP (always flatten first, then enter)
+      // ENTER / FLIP:
+      // STRICT: prefer seq=1 (if provided). ENTER is allowed even if CANCAL missing
+      // because it can self-recover *only if it detects not-flat*.
       if (action === 'ENTER' || action === 'FLIP') {
-        const flat = await simpleFlatten(msg);
-        if (!flat) return { ok:false, error:'flatten_timeout' };
+
+        if (STRICT_SEQUENCE) {
+          if (!sigId) return { ok:true, ignored:'ENTER_missing_sig_id' };
+          if (Number.isFinite(seq) && seq !== 1) return { ok:true, ignored:'ENTER_seq_mismatch', expected:1, got: msg.seq };
+        }
+
+        const st = (STRICT_SEQUENCE && sigId) ? (getSigState(sigId) || { lastSeq: -1, symbol: psym }) : null;
+
+        // If ENTER already processed for this sig_id, ignore duplicates (idempotency already helps, this is extra safety)
+        if (STRICT_SEQUENCE && st && st.lastSeq >= 1) {
+          return { ok:true, ignored:'ENTER_already_seen', sig_id: sigId, have: st.lastSeq };
+        }
+
+        // require_flat gating (default true)
+        const requireFlat = (typeof msg.require_flat === 'undefined') ? true : !!msg.require_flat;
+
+        // ✅ Decide whether ENTER should self-flatten:
+        // - If user explicitly sets cancel_orders/close_position, respect it.
+        // - Else, if require_flat=true:
+        //     * if already flat -> default no flatten (protect existing ladders)
+        //     * if not flat -> default flatten (self-recover if CANCAL missed)
+        if (typeof msg.cancel_orders_scope === 'undefined') msg.cancel_orders_scope = 'SYMBOL';
+
+        let flatNow = true;
+        if (requireFlat) {
+          flatNow = isScopeAll(msg) ? await isFlatNowGlobal() : await isFlatNowSymbol(psym);
+        }
+
+        if (typeof msg.cancel_orders === 'undefined') msg.cancel_orders = requireFlat ? (!flatNow) : false;
+        if (typeof msg.close_position === 'undefined') msg.close_position = requireFlat ? (!flatNow) : false;
+
+        // Perform flatten if enabled
+        const steps = await flattenFromMsg(msg, psym);
+
+        // Gate until flat if required
+        if (requireFlat) {
+          const flat = isScopeAll(msg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
+          console.log('flat gate result:', flat);
+          if (!flat) return { ok:false, error:'require_flat_timeout', sig_id: sigId, steps };
+        }
 
         const r = await placeEntry(msg);
-        return { ok:true, step:'entry', r };
+
+        if (STRICT_SEQUENCE && sigId) {
+          setSigState(sigId, { lastSeq: 1, symbol: psym });
+        }
+
+        // ✅ If a BATCH_TPS was queued early, flush it right after a successful ENTER.
+        let batch = null;
+        let batch_error = null;
+        const pendingMsg = STRICT_SEQUENCE && sigId ? takePendingBatch(sigId) : null;
+        if (pendingMsg) {
+          try {
+            batch = await placeBatch(pendingMsg);
+            if (STRICT_SEQUENCE && sigId) setSigState(sigId, { lastSeq: 2, symbol: psym });
+          } catch (e) {
+            batch_error = String(e?.message || e);
+          }
+        }
+
+        // Helpful flag if we recovered without having seen CANCAL
+        const recovered = (STRICT_SEQUENCE && st && st.lastSeq < 0);
+
+        return {
+          ok:true,
+          step: pendingMsg ? 'entry+batch' : 'entry',
+          recovered_without_cancal: !!recovered,
+          self_flattened: requireFlat ? (!flatNow) : false,
+          steps,
+          r,
+          batch,
+          batch_error
+        };
       }
 
-      // Optional explicit actions (kept)
-      if (action === 'DELTA_CANCEL_ALL' || action === 'CANCEL_ALL') {
-        const r = await cancelAllOrders();
-        return { ok:true, did:'cancel_all_orders', r };
-      }
-      if (action === 'CLOSE_POSITION') {
-        const r = await closeAllPositions();
-        return { ok:true, did:'close_all_positions', r };
+      // Fallback: treat as entry (you can keep this OFF in strict mode)
+      if (STRICT_SEQUENCE) {
+        return { ok:true, ignored:'unknown_action_in_strict_mode', action, sig_id: sigId, seq: msg.seq };
       }
 
-      return { ok:true, ignored:'unknown_action', action };
+      const r = await placeEntry(msg);
+      return { ok:true, step:'entry', r };
     });
 
     return res.json(out);
@@ -538,4 +950,4 @@ app.post('/tv', async (req, res) => {
   }
 });
 
-app.listen(PORT, ()=>console.log(`Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE})`));
+app.listen(PORT, ()=>console.log(`Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE})`));
