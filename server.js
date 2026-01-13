@@ -11,6 +11,10 @@
 //    it will auto-set cancel_orders+close_position to true (unless explicitly provided) to self-recover.
 // 4) STRICT mode requires numeric seq whenever sig_id exists (prevents late CANCAL w/out seq nuking fresh ENTER).
 // 5) Fire-and-forget learnLotMultFromPositions is .catch()’d to avoid unhandled promise rejections.
+//
+// ✅ UPDATES ADDED (your request):
+// A) flattenFromMsg(): default cancel_orders_scope is SYMBOL unless scope is ALL
+// B) CANCAL handler: if cancel_orders_scope not provided, set it to SYMBOL (extra safety)
 
 require('dotenv').config();
 const express = require('express');
@@ -656,7 +660,11 @@ async function flattenFromMsg(msg, psym){
 
   // If you want strict safety for multi-symbol accounts:
   // - send msg.cancel_orders_scope="SYMBOL" to avoid cancelling everything.
-  const cancelScope = String(msg.cancel_orders_scope || '').toUpperCase(); // "SYMBOL" | "" (default)
+  // ✅ UPDATED: default to SYMBOL unless scope is ALL
+  const cancelScope = String(
+    msg.cancel_orders_scope || (scopeAll ? 'ALL' : 'SYMBOL')
+  ).toUpperCase(); // "SYMBOL" | "ALL"
+
   const cancelFallbackAll = !!msg.cancel_fallback_all;
 
   const steps = {
@@ -670,16 +678,13 @@ async function flattenFromMsg(msg, psym){
 
   if (doCancelOrders) {
     try {
-      if (scopeAll) {
+      // ✅ UPDATED: respect cancelScope ALL vs SYMBOL
+      if (scopeAll || cancelScope === 'ALL') {
         await cancelAllOrders();
         steps.cancel_mode = 'cancel_all_orders';
-      } else if (cancelScope === 'SYMBOL') {
+      } else {
         await cancelOrdersBySymbol(psym, { fallbackAll: cancelFallbackAll });
         steps.cancel_mode = 'cancel_symbol_orders';
-      } else {
-        // default behavior (single-symbol users): cancel all orders
-        await cancelAllOrders();
-        steps.cancel_mode = 'cancel_all_orders';
       }
       steps.cancel_orders = true;
     } catch (e) {
@@ -795,6 +800,9 @@ app.post('/tv', async (req, res) => {
         if (STRICT_SEQUENCE && sigId && Number.isFinite(seq) && seq !== 0) {
           return { ok:true, ignored:'CANCAL_seq_mismatch', expected:0, got: seq, sig_id: sigId };
         }
+
+        // ✅ UPDATED: default cancel_orders_scope=SYMBOL if not provided
+        if (typeof msg.cancel_orders_scope === 'undefined') msg.cancel_orders_scope = 'SYMBOL';
 
         const steps = await flattenFromMsg(msg, psym);
 
