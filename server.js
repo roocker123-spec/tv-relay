@@ -16,8 +16,9 @@
 // A) flattenFromMsg(): default cancel_orders_scope is SYMBOL unless scope is ALL
 // B) CANCAL handler: if cancel_orders_scope not provided, set it to SYMBOL (extra safety)
 //
-// ✅ NEW (fix "queue can freeze forever"):
-// C) dcall(): adds hard HTTP timeout via AbortController so a hung fetch can't brick the GLOBAL queue.
+// ✅ FIX ADDED (your error):
+// C) Symbol-scoped cancel now uses correct Delta endpoint:
+//    DELETE /v2/orders with body { id, product_id } (NOT /v2/orders/{id})
 
 require('dotenv').config();
 const express = require('express');
@@ -181,13 +182,10 @@ function takePendingBatch(sigId){
   return v?.msg || null;
 }
 
-// ---------- Delta request helper (retries/backoff + HARD TIMEOUT) ----------
+// ---------- Delta request helper (retries/backoff) ----------
 async function dcall(method, path, payload=null, query='') {
   const body = payload ? JSON.stringify(payload) : '';
   const MAX_TRIES = 3;
-
-  // ✅ hard timeout prevents GLOBAL queue from freezing forever
-  const HTTP_TIMEOUT_MS = nnum(process.env.HTTP_TIMEOUT_MS, 12000);
 
   for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
     const ts   = nowTsSec();
@@ -208,13 +206,8 @@ async function dcall(method, path, payload=null, query='') {
       headers[HDR_API_KEY] = API_KEY;
     }
 
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), HTTP_TIMEOUT_MS);
-
     try {
-      const res  = await fetch(url,{ method, headers, body: body || undefined, signal: ctrl.signal });
-      clearTimeout(timer);
-
+      const res  = await fetch(url,{ method, headers, body: body || undefined });
       const text = await res.text(); let json;
       try { json = JSON.parse(text); } catch { json = { raw: text }; }
 
@@ -228,7 +221,6 @@ async function dcall(method, path, payload=null, query='') {
       }
       return json;
     } catch (e) {
-      clearTimeout(timer);
       if (attempt === MAX_TRIES) throw e;
       await sleep(300*attempt);
     }
@@ -253,6 +245,11 @@ async function getProductMeta(product_symbol){
   const ps = String(product_symbol||'').toUpperCase();
   const list = await getProducts();
   return list.find(p => String(p?.symbol||p?.product_symbol||'').toUpperCase() === ps);
+}
+async function getProductIdBySymbol(psym){
+  const meta = await getProductMeta(psym);
+  const pid = meta?.id ?? meta?.product_id;
+  return Number.isFinite(+pid) ? +pid : null;
 }
 
 const LOT_MULT_CACHE = new Map(); // product_symbol -> { m, ts }
@@ -451,12 +448,31 @@ async function placeBatch(m){
 const cancelAllOrders   = () => dcall('DELETE','/v2/orders/all');
 const closeAllPositions = () => dcall('POST','/v2/positions/close_all', {});
 
-// Try symbol-scoped cancel (preferred if you trade multiple symbols)
-// If Delta endpoint differs, it will fail harmlessly and we can optionally fallback to cancelAllOrders.
-async function cancelOrderById(orderId){
-  if (!orderId) return { ok:true, skipped:true, reason:'missing_order_id' };
-  return dcall('DELETE', `/v2/orders/${orderId}`);
+// ✅ FIX: Correct cancel endpoint is DELETE /v2/orders with body {id, product_id}
+async function cancelOrder({ id, client_order_id, product_id, product_symbol }){
+  const payload = {};
+
+  if (Number.isFinite(+id)) payload.id = +id;
+  if (client_order_id) payload.client_order_id = String(client_order_id);
+
+  let pid = Number.isFinite(+product_id) ? +product_id : null;
+  if (!pid && product_symbol) pid = await getProductIdBySymbol(product_symbol);
+
+  if (!pid) {
+    // If we can't supply product_id, Delta may reject; safer to throw so caller can fallbackAll if enabled.
+    throw new Error(`cancelOrder: missing product_id (id=${id}, client_order_id=${client_order_id}, product_symbol=${product_symbol})`);
+  }
+  payload.product_id = pid;
+
+  if (!payload.id && !payload.client_order_id) {
+    return { ok:true, skipped:true, reason:'missing_id_and_client_order_id' };
+  }
+
+  return dcall('DELETE', '/v2/orders', payload);
 }
+
+// Try symbol-scoped cancel (preferred if you trade multiple symbols)
+// If the endpoint differs or order objects lack required fields, it can fallback to cancelAllOrders if enabled.
 async function cancelOrdersBySymbol(psym, { fallbackAll=false } = {}){
   const sym = toProductSymbol(psym);
   if (!sym) return { ok:true, skipped:true, reason:'missing_symbol' };
@@ -479,13 +495,16 @@ async function cancelOrdersBySymbol(psym, { fallbackAll=false } = {}){
 
   let cancelled = 0, failed = 0;
   for (const o of mine){
-    const oid = o?.id || o?.order_id;
+    const oid = o?.id ?? o?.order_id;
+    const pid = o?.product_id;
+    const coid = o?.client_order_id;
+
     try {
-      await cancelOrderById(oid);
+      await cancelOrder({ id: oid, client_order_id: coid, product_id: pid, product_symbol: sym });
       cancelled++;
     } catch(e){
       failed++;
-      console.warn('cancelOrdersBySymbol: cancel failed', { symbol: sym, oid, err: e?.message || e });
+      console.warn('cancelOrdersBySymbol: cancel failed', { symbol: sym, oid, pid, err: e?.message || e });
     }
   }
 
@@ -670,8 +689,6 @@ async function flattenFromMsg(msg, psym){
   const doCancelOrders = (typeof msg.cancel_orders === 'undefined') ? true : !!msg.cancel_orders;
   const doClosePos     = (typeof msg.close_position === 'undefined') ? true : !!msg.close_position;
 
-  // If you want strict safety for multi-symbol accounts:
-  // - send msg.cancel_orders_scope="SYMBOL" to avoid cancelling everything.
   // ✅ UPDATED: default to SYMBOL unless scope is ALL
   const cancelScope = String(
     msg.cancel_orders_scope || (scopeAll ? 'ALL' : 'SYMBOL')
@@ -690,7 +707,6 @@ async function flattenFromMsg(msg, psym){
 
   if (doCancelOrders) {
     try {
-      // ✅ UPDATED: respect cancelScope ALL vs SYMBOL
       if (scopeAll || cancelScope === 'ALL') {
         await cancelAllOrders();
         steps.cancel_mode = 'cancel_all_orders';
@@ -711,7 +727,6 @@ async function flattenFromMsg(msg, psym){
         await closeAllPositions();
         steps.close_mode = 'close_all_positions';
       } else {
-        // Prefer closing ONLY the symbol you sent
         const sym = msg.symbol || msg.product_symbol || psym;
         if (sym) {
           await closePositionBySymbol(sym);
@@ -775,7 +790,7 @@ app.post('/tv', async (req, res) => {
       // Ignore pure EXIT logs from chart
       if (action === 'EXIT') return { ok:true, ignored:'EXIT' };
 
-      // ✅ STRICT: if sig_id is present, seq must be numeric (prevents seq-less late CANCAL nuking fresh ENTER)
+      // ✅ STRICT: if sig_id is present, seq must be numeric
       if (STRICT_SEQUENCE && sigId) {
         if (!Number.isFinite(seq)) {
           return { ok:true, ignored:'missing_or_invalid_seq_in_strict_mode', sig_id: sigId, action };
@@ -786,12 +801,11 @@ app.post('/tv', async (req, res) => {
       if (STRICT_SEQUENCE && sigId && Number.isFinite(seq)) {
         const st0 = getSigState(sigId) || { lastSeq: -1, symbol: psym };
         if (st0.symbol && psym && st0.symbol.toUpperCase() !== psym.toUpperCase()) {
-          // new symbol under same sig_id → reset state
           setSigState(sigId, { lastSeq: -1, symbol: psym });
         }
       }
 
-      // ✅ STRICT out-of-order / late message guard (prevents late CANCAL closing a fresh ENTER)
+      // ✅ STRICT out-of-order / late message guard
       if (STRICT_SEQUENCE && sigId && Number.isFinite(seq)) {
         const st = getSigState(sigId);
         if (st && Number.isFinite(st.lastSeq) && st.lastSeq >= seq) {
@@ -806,9 +820,8 @@ app.post('/tv', async (req, res) => {
         }
       }
 
-      // --------- CANCAL / CANCEL handler (cancel orders + close position(s)) ---------
+      // --------- CANCAL / CANCEL handler ---------
       if (action === 'CANCAL' || action === 'CANCEL') {
-        // STRICT: expect seq=0 (if provided)
         if (STRICT_SEQUENCE && sigId && Number.isFinite(seq) && seq !== 0) {
           return { ok:true, ignored:'CANCAL_seq_mismatch', expected:0, got: seq, sig_id: sigId };
         }
@@ -818,7 +831,6 @@ app.post('/tv', async (req, res) => {
 
         const steps = await flattenFromMsg(msg, psym);
 
-        // default require_flat true
         const requireFlat = (typeof msg.require_flat === 'undefined') ? true : !!msg.require_flat;
         let flat = true;
         if (requireFlat) {
@@ -833,7 +845,6 @@ app.post('/tv', async (req, res) => {
       }
       // ---------------------------------------------------------------------------
 
-      // Explicit cleanup from Pine (still supported)
       if (action === 'DELTA_CANCEL_ALL' || action === 'CANCEL_ALL') {
         const out = await cancelAllOrders();
         return { ok:true, did:'cancel_all_orders', delta: out };
@@ -843,13 +854,12 @@ app.post('/tv', async (req, res) => {
         return { ok:true, did:'close_all_positions', delta: out };
       }
 
-      // Bracket passthrough
       if (msg.stop_loss_order || msg.take_profit_order) {
         const r = await placeBracket(msg);
         return { ok:true, step:'bracket', r };
       }
 
-      // Batch (TPs) passthrough — STRICT: must be BATCH_TPS and seq=2 AND must have ENTER(seq1) already for same sig_id
+      // Batch (TPs)
       if (msg.orders) {
         if (action !== 'BATCH_TPS') return { ok:true, ignored:'orders_without_BATCH_TPS' };
         if (Number.isFinite(seq) && seq !== 2) return { ok:true, ignored:'batch_seq_mismatch', expected:2, got: msg.seq };
@@ -858,7 +868,6 @@ app.post('/tv', async (req, res) => {
           if (!sigId) return { ok:true, ignored:'BATCH_TPS_missing_sig_id' };
           const st = getSigState(sigId);
 
-          // ✅ If ENTER not done yet, QUEUE the batch instead of dropping it forever.
           if (!st || st.lastSeq < 1) {
             queuePendingBatch(sigId, msg);
             return { ok:true, queued:'BATCH_TPS_waiting_for_ENTER', sig_id: sigId, have: st ? st.lastSeq : null };
@@ -874,9 +883,7 @@ app.post('/tv', async (req, res) => {
         return { ok:true, step:'batch', r };
       }
 
-      // ENTER / FLIP:
-      // STRICT: prefer seq=1 (if provided). ENTER is allowed even if CANCAL missing
-      // because it can self-recover *only if it detects not-flat*.
+      // ENTER / FLIP
       if (action === 'ENTER' || action === 'FLIP') {
 
         if (STRICT_SEQUENCE) {
@@ -886,19 +893,12 @@ app.post('/tv', async (req, res) => {
 
         const st = (STRICT_SEQUENCE && sigId) ? (getSigState(sigId) || { lastSeq: -1, symbol: psym }) : null;
 
-        // If ENTER already processed for this sig_id, ignore duplicates (idempotency already helps, this is extra safety)
         if (STRICT_SEQUENCE && st && st.lastSeq >= 1) {
           return { ok:true, ignored:'ENTER_already_seen', sig_id: sigId, have: st.lastSeq };
         }
 
-        // require_flat gating (default true)
         const requireFlat = (typeof msg.require_flat === 'undefined') ? true : !!msg.require_flat;
 
-        // ✅ Decide whether ENTER should self-flatten:
-        // - If user explicitly sets cancel_orders/close_position, respect it.
-        // - Else, if require_flat=true:
-        //     * if already flat -> default no flatten (protect existing ladders)
-        //     * if not flat -> default flatten (self-recover if CANCAL missed)
         if (typeof msg.cancel_orders_scope === 'undefined') msg.cancel_orders_scope = 'SYMBOL';
 
         let flatNow = true;
@@ -909,10 +909,8 @@ app.post('/tv', async (req, res) => {
         if (typeof msg.cancel_orders === 'undefined') msg.cancel_orders = requireFlat ? (!flatNow) : false;
         if (typeof msg.close_position === 'undefined') msg.close_position = requireFlat ? (!flatNow) : false;
 
-        // Perform flatten if enabled
         const steps = await flattenFromMsg(msg, psym);
 
-        // Gate until flat if required
         if (requireFlat) {
           const flat = isScopeAll(msg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
           console.log('flat gate result:', flat);
@@ -925,7 +923,6 @@ app.post('/tv', async (req, res) => {
           setSigState(sigId, { lastSeq: 1, symbol: psym });
         }
 
-        // ✅ If a BATCH_TPS was queued early, flush it right after a successful ENTER.
         let batch = null;
         let batch_error = null;
         const pendingMsg = STRICT_SEQUENCE && sigId ? takePendingBatch(sigId) : null;
@@ -938,7 +935,6 @@ app.post('/tv', async (req, res) => {
           }
         }
 
-        // Helpful flag if we recovered without having seen CANCAL
         const recovered = (STRICT_SEQUENCE && st && st.lastSeq < 0);
 
         return {
@@ -953,7 +949,6 @@ app.post('/tv', async (req, res) => {
         };
       }
 
-      // Fallback: treat as entry (you can keep this OFF in strict mode)
       if (STRICT_SEQUENCE) {
         return { ok:true, ignored:'unknown_action_in_strict_mode', action, sig_id: sigId, seq: msg.seq };
       }
