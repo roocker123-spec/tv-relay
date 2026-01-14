@@ -15,6 +15,9 @@
 // ✅ UPDATES ADDED (your request):
 // A) flattenFromMsg(): default cancel_orders_scope is SYMBOL unless scope is ALL
 // B) CANCAL handler: if cancel_orders_scope not provided, set it to SYMBOL (extra safety)
+//
+// ✅ NEW (fix "queue can freeze forever"):
+// C) dcall(): adds hard HTTP timeout via AbortController so a hung fetch can't brick the GLOBAL queue.
 
 require('dotenv').config();
 const express = require('express');
@@ -178,10 +181,13 @@ function takePendingBatch(sigId){
   return v?.msg || null;
 }
 
-// ---------- Delta request helper (retries/backoff) ----------
+// ---------- Delta request helper (retries/backoff + HARD TIMEOUT) ----------
 async function dcall(method, path, payload=null, query='') {
   const body = payload ? JSON.stringify(payload) : '';
   const MAX_TRIES = 3;
+
+  // ✅ hard timeout prevents GLOBAL queue from freezing forever
+  const HTTP_TIMEOUT_MS = nnum(process.env.HTTP_TIMEOUT_MS, 12000);
 
   for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
     const ts   = nowTsSec();
@@ -202,8 +208,13 @@ async function dcall(method, path, payload=null, query='') {
       headers[HDR_API_KEY] = API_KEY;
     }
 
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), HTTP_TIMEOUT_MS);
+
     try {
-      const res  = await fetch(url,{ method, headers, body: body || undefined });
+      const res  = await fetch(url,{ method, headers, body: body || undefined, signal: ctrl.signal });
+      clearTimeout(timer);
+
       const text = await res.text(); let json;
       try { json = JSON.parse(text); } catch { json = { raw: text }; }
 
@@ -217,6 +228,7 @@ async function dcall(method, path, payload=null, query='') {
       }
       return json;
     } catch (e) {
+      clearTimeout(timer);
       if (attempt === MAX_TRIES) throw e;
       await sleep(300*attempt);
     }
