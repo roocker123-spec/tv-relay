@@ -7,6 +7,11 @@
 // - SIG_STATE is now keyed by (sig_id|product_symbol) instead of only sig_id
 // - PENDING_BATCH is now keyed by (sig_id|product_symbol)
 // - Queue is per symbol (so multi-symbol alerts don’t block each other)
+//
+// ✅ BATCH FIX (your "no batch got fired" issue):
+// - placeBatch() now sends ONLY Delta-compatible payload to /v2/orders/batch
+//   (whitelists just {orders:[...]}) so Delta won't reject due to extra keys
+// - keeps your TP auto-correct (reduce_only, side flip, coins->lots)
 
 require('dotenv').config();
 const express = require('express');
@@ -388,44 +393,69 @@ async function placeBracket(m){
   return dcall('POST','/v2/orders/bracket', body);
 }
 
+/**
+ * ✅ FIXED placeBatch():
+ * - Sends ONLY { orders:[...] } to /v2/orders/batch (no extra keys)
+ * - Keeps your auto-correct: reduce_only, side flip, coins->lots
+ */
 async function placeBatch(m){
-  const {action, ...bodyIn} = m;
-  const body = { ...bodyIn };
-  if(!body.product_symbol && !body.product_id) body.product_symbol = toProductSymbol(m.product_symbol || m.symbol);
+  // Strip non-Delta fields (sig_id/seq/symbol/trigger_time/strategy_id/reason/etc)
+  const psymFromMsg = toProductSymbol(m.product_symbol || m.symbol);
 
+  const body = {
+    orders: Array.isArray(m.orders) ? m.orders : []
+  };
+
+  if (!body.orders.length) {
+    throw new Error('placeBatch: missing orders[]');
+  }
+
+  // Auto-correct: reduce_only + exit-side correction + coin->lot normalization
   try {
-    const psym = body.product_symbol;
-    const last = LAST_SIDE.get(psym);
+    const psym = psymFromMsg || body.orders?.[0]?.product_symbol;
+    const last = psym ? LAST_SIDE.get(psym) : null;
 
-    let lotMult = getCachedLotMult(psym);
-    if (!lotMult) {
+    let lotMult = psym ? getCachedLotMult(psym) : null;
+    if (psym && !lotMult) {
       const meta  = await getProductMeta(psym);
       lotMult = lotMultiplierFromMeta(meta);
       setCachedLotMult(psym, lotMult);
     }
+    lotMult = lotMult || 1;
 
-    if (Array.isArray(body.orders)) {
-      body.orders = body.orders.map(o => {
-        const oo = { ...o };
+    body.orders = body.orders.map(o => {
+      const oo = { ...o };
 
-        const coins = nnum(oo.size_coins ?? oo.coins, 0);
-        if (coins > 0) oo.size = Math.max(1, Math.floor(coins / lotMult));
+      // Ensure product_symbol exists on each order
+      if (!oo.product_symbol) oo.product_symbol = psym;
+      if (!oo.product_symbol) throw new Error('placeBatch: order missing product_symbol');
 
-        if (!coins && nnum(oo.size,0) > lotMult && Math.abs(nnum(oo.size,0) / lotMult - Math.round(nnum(oo.size,0) / lotMult)) < 1e-6) {
-          oo.size = Math.max(1, Math.floor(nnum(oo.size,0) / lotMult));
-        }
+      // If script sends coins, convert to lots
+      const coins = nnum(oo.size_coins ?? oo.coins, 0);
+      if (coins > 0) oo.size = Math.max(1, Math.floor(coins / lotMult));
 
-        if (last && (!oo.side || String(oo.side).toLowerCase() === last)) {
-          oo.side = oppositeSide(last);
-        }
-        if (typeof oo.reduce_only === 'undefined') oo.reduce_only = true;
-        return oo;
-      });
-    }
+      // If size looks like coins, convert
+      if (!coins && nnum(oo.size,0) > lotMult &&
+          Math.abs(nnum(oo.size,0) / lotMult - Math.round(nnum(oo.size,0) / lotMult)) < 1e-6) {
+        oo.size = Math.max(1, Math.floor(nnum(oo.size,0) / lotMult));
+      }
+
+      // Ensure TP exits are opposite of last entry side
+      if (last && (!oo.side || String(oo.side).toLowerCase() === last)) {
+        oo.side = oppositeSide(last);
+      }
+
+      // Ensure reduce_only true
+      if (typeof oo.reduce_only === 'undefined') oo.reduce_only = true;
+
+      return oo;
+    });
+
   } catch(e){
     console.warn('batch auto-correct warning:', e?.message || e);
   }
 
+  // Send only the Delta-compatible payload
   return dcall('POST','/v2/orders/batch', body);
 }
 
