@@ -8,10 +8,13 @@
 // - PENDING_BATCH is now keyed by (sig_id|product_symbol)
 // - Queue is per symbol (so multi-symbol alerts don’t block each other)
 //
-// ✅ BATCH FIX (your "no batch got fired" issue):
-// - placeBatch() now sends ONLY Delta-compatible payload to /v2/orders/batch
-//   (whitelists just {orders:[...]}) so Delta won't reject due to extra keys
-// - keeps your TP auto-correct (reduce_only, side flip, coins->lots)
+// ✅ BATCH FIX:
+// - placeBatch() now sends Delta-compatible payload: {product_id, product_symbol, orders:[...]}
+//   (Delta batch requires top-level product_id/product_symbol)
+// - per-order strict whitelist to avoid Delta rejecting unknown keys
+//
+// ✅ DEDUPE FIX:
+// - seenKey() now includes orders hash when present so duplicate BATCH alerts dedupe correctly
 
 require('dotenv').config();
 const express = require('express');
@@ -104,10 +107,18 @@ const STRICT_SEQUENCE = String(process.env.STRICT_SEQUENCE || 'true').toLowerCas
 const SEEN = new Map();              // key -> ts(ms)
 const SEEN_TTL_MS = 60_000;
 
-// ✅ includes sig_id + seq
+// ✅ includes sig_id + seq + orders hash when present (for BATCH dedupe)
 function seenKey(msg){
   const sig = String(msg.sig_id || msg.signal_id || '');
   const seq = String(msg.seq ?? '');
+
+  let ordersHash = '';
+  if (Array.isArray(msg.orders)) {
+    try {
+      ordersHash = crypto.createHash('sha1').update(JSON.stringify(msg.orders)).digest('hex');
+    } catch { ordersHash = 'orders_hash_fail'; }
+  }
+
   const p = [
     String(msg.action||''),
     String(msg.product_symbol||msg.symbol||''),
@@ -117,8 +128,10 @@ function seenKey(msg){
     String(msg.strategy_id||''),
     sig,
     seq,
-    String(msg.amount||msg.amount_inr||msg.amount_usd||msg.order_amount||'')
+    String(msg.amount||msg.amount_inr||msg.amount_usd||msg.order_amount||''),
+    ordersHash
   ].join('|');
+
   return crypto.createHash('sha1').update(p).digest('hex');
 }
 
@@ -395,42 +408,47 @@ async function placeBracket(m){
 
 /**
  * ✅ FIXED placeBatch():
- * - Sends ONLY { orders:[...] } to /v2/orders/batch (no extra keys)
- * - Keeps your auto-correct: reduce_only, side flip, coins->lots
+ * - Delta batch create requires top-level product_id or product_symbol
+ * - Sends only allowed fields per order to avoid Delta rejecting unknown keys
+ * - Keeps: reduce_only, side flip, coins->lots
  */
 async function placeBatch(m){
-  // Strip non-Delta fields (sig_id/seq/symbol/trigger_time/strategy_id/reason/etc)
-  const psymFromMsg = toProductSymbol(m.product_symbol || m.symbol);
+  // Resolve symbol
+  const psym =
+    toProductSymbol(m.product_symbol || m.symbol) ||
+    toProductSymbol(m?.orders?.[0]?.product_symbol);
 
-  const body = {
-    orders: Array.isArray(m.orders) ? m.orders : []
-  };
+  if (!psym) throw new Error('placeBatch: missing product_symbol/symbol');
 
-  if (!body.orders.length) {
+  // Resolve product_id (preferred)
+  const pid =
+    (Number.isFinite(+m.product_id) ? +m.product_id : null) ||
+    (await getProductIdBySymbol(psym));
+
+  if (!pid) throw new Error(`placeBatch: could not resolve product_id for ${psym}`);
+
+  if (!Array.isArray(m.orders) || !m.orders.length) {
     throw new Error('placeBatch: missing orders[]');
   }
 
-  // Auto-correct: reduce_only + exit-side correction + coin->lot normalization
-  try {
-    const psym = psymFromMsg || body.orders?.[0]?.product_symbol;
-    const last = psym ? LAST_SIDE.get(psym) : null;
+  // Lot multiplier for coins->lots conversion
+  let lotMult = getCachedLotMult(psym);
+  if (!lotMult) {
+    const meta  = await getProductMeta(psym);
+    lotMult = lotMultiplierFromMeta(meta);
+    setCachedLotMult(psym, lotMult);
+  }
+  lotMult = lotMult || 1;
 
-    let lotMult = psym ? getCachedLotMult(psym) : null;
-    if (psym && !lotMult) {
-      const meta  = await getProductMeta(psym);
-      lotMult = lotMultiplierFromMeta(meta);
-      setCachedLotMult(psym, lotMult);
-    }
-    lotMult = lotMult || 1;
+  const last = LAST_SIDE.get(psym) || null;
 
-    body.orders = body.orders.map(o => {
+  const body = {
+    product_id: pid,
+    product_symbol: psym,
+    orders: m.orders.slice(0, 50).map((o, idx) => {
       const oo = { ...o };
 
-      // Ensure product_symbol exists on each order
-      if (!oo.product_symbol) oo.product_symbol = psym;
-      if (!oo.product_symbol) throw new Error('placeBatch: order missing product_symbol');
-
-      // If script sends coins, convert to lots
+      // coins -> lots
       const coins = nnum(oo.size_coins ?? oo.coins, 0);
       if (coins > 0) oo.size = Math.max(1, Math.floor(coins / lotMult));
 
@@ -448,14 +466,47 @@ async function placeBatch(m){
       // Ensure reduce_only true
       if (typeof oo.reduce_only === 'undefined') oo.reduce_only = true;
 
-      return oo;
-    });
+      // Default type
+      if (!oo.order_type) oo.order_type = 'limit_order';
 
-  } catch(e){
-    console.warn('batch auto-correct warning:', e?.message || e);
-  }
+      // Normalize limit_price
+      if (!oo.limit_price && (oo.price || oo.lmt_price)) oo.limit_price = oo.price || oo.lmt_price;
 
-  // Send only the Delta-compatible payload
+      // Normalize types
+      oo.size = Math.max(1, parseInt(oo.size, 10) || 0);
+      if (!oo.size) throw new Error(`placeBatch: bad size on order #${idx}`);
+
+      if (typeof oo.limit_price !== 'undefined') oo.limit_price = String(oo.limit_price);
+
+      // Remove unsupported
+      delete oo.time_in_force;
+
+      // Strict whitelist
+      const allowed = [
+        'limit_price',
+        'size',
+        'side',
+        'order_type',
+        'reduce_only',
+        'post_only',
+        'mmp',
+        'client_order_id'
+      ];
+
+      const cleaned = {};
+      for (const k of allowed) {
+        if (typeof oo[k] !== 'undefined') cleaned[k] = oo[k];
+      }
+
+      // Final guards
+      if (!cleaned.limit_price) throw new Error(`placeBatch: missing limit_price on order #${idx}`);
+      if (!cleaned.side) throw new Error(`placeBatch: missing side on order #${idx}`);
+      if (!cleaned.order_type) cleaned.order_type = 'limit_order';
+
+      return cleaned;
+    })
+  };
+
   return dcall('POST','/v2/orders/batch', body);
 }
 
