@@ -19,6 +19,15 @@
 // ✅ FIX ADDED (your error):
 // C) Symbol-scoped cancel now uses correct Delta endpoint:
 //    DELETE /v2/orders with body { id, product_id } (NOT /v2/orders/{id})
+//
+// ✅ NEW (your request: keep CANCAL+ENTER same signal bar; BATCH next bar; but ENTER must be FAST):
+// D) FAST_ENTER mode: do a short flat-wait (e.g. 2000ms), then attempt entry immediately.
+//    If entry fails (exchange rejects due to not-flat), retry once after a longer wait.
+//
+// ENV you can set:
+// FAST_ENTER=true
+// FAST_ENTER_WAIT_MS=2000
+// FAST_ENTER_RETRY_MS=8000
 
 require('dotenv').config();
 const express = require('express');
@@ -100,6 +109,11 @@ const FLAT_POLL_MS       = nnum(process.env.FLAT_POLL_MS, 400);
 
 // ---------- STRICT sequence (default ON) ----------
 const STRICT_SEQUENCE = String(process.env.STRICT_SEQUENCE || 'true').toLowerCase() !== 'false';
+
+// ✅ FAST_ENTER mode (new)
+const FAST_ENTER          = String(process.env.FAST_ENTER || 'false').toLowerCase() === 'true';
+const FAST_ENTER_WAIT_MS  = nnum(process.env.FAST_ENTER_WAIT_MS, 2000);
+const FAST_ENTER_RETRY_MS = nnum(process.env.FAST_ENTER_RETRY_MS, 8000);
 
 // ---------- idempotency (drops dupes ~60s) ----------
 const SEEN = new Map();              // key -> ts(ms)
@@ -901,16 +915,108 @@ app.post('/tv', async (req, res) => {
 
         if (typeof msg.cancel_orders_scope === 'undefined') msg.cancel_orders_scope = 'SYMBOL';
 
+        // Check if already flat (so we don't waste time flattening)
         let flatNow = true;
         if (requireFlat) {
           flatNow = isScopeAll(msg) ? await isFlatNowGlobal() : await isFlatNowSymbol(psym);
         }
 
+        // If require_flat and NOT flat, default to flatten true; if flat, keep false
         if (typeof msg.cancel_orders === 'undefined') msg.cancel_orders = requireFlat ? (!flatNow) : false;
         if (typeof msg.close_position === 'undefined') msg.close_position = requireFlat ? (!flatNow) : false;
 
+        // Start flatten steps immediately (cancel/close)
         const steps = await flattenFromMsg(msg, psym);
 
+        // Helper: after entry, flush queued BATCH_TPS (if any)
+        async function flushQueuedBatchIfAny(){
+          let batch = null;
+          let batch_error = null;
+          const pendingMsg = STRICT_SEQUENCE && sigId ? takePendingBatch(sigId) : null;
+          if (pendingMsg) {
+            try {
+              batch = await placeBatch(pendingMsg);
+              if (STRICT_SEQUENCE && sigId) setSigState(sigId, { lastSeq: 2, symbol: psym });
+            } catch (e) {
+              batch_error = String(e?.message || e);
+            }
+          }
+          return { pendingMsg, batch, batch_error };
+        }
+
+        // ---------------- FAST ENTER mode (NEW) ----------------
+        if (requireFlat && FAST_ENTER) {
+          // Short wait only
+          const flatOk = isScopeAll(msg)
+            ? await waitUntilFlat(FAST_ENTER_WAIT_MS, FLAT_POLL_MS)
+            : await waitUntilFlatSymbol(psym, FAST_ENTER_WAIT_MS, FLAT_POLL_MS);
+
+          console.log('FAST_ENTER flat gate (short):', { flatOk, waitMs: FAST_ENTER_WAIT_MS, psym });
+
+          // Try entry immediately
+          try {
+            const r = await placeEntry(msg);
+
+            if (STRICT_SEQUENCE && sigId) {
+              setSigState(sigId, { lastSeq: 1, symbol: psym });
+            }
+
+            const { pendingMsg, batch, batch_error } = await flushQueuedBatchIfAny();
+
+            const recovered = (STRICT_SEQUENCE && st && st.lastSeq < 0);
+            return {
+              ok:true,
+              step: pendingMsg ? 'entry+batch' : 'entry',
+              fast_enter: true,
+              flatOk_short_wait: flatOk,
+              recovered_without_cancal: !!recovered,
+              self_flattened: !flatNow,
+              steps,
+              r,
+              batch,
+              batch_error
+            };
+
+          } catch (e) {
+            console.warn('FAST_ENTER first attempt failed:', e?.message || e);
+
+            // Retry once after longer wait
+            const flat2 = isScopeAll(msg)
+              ? await waitUntilFlat(FAST_ENTER_RETRY_MS, FLAT_POLL_MS)
+              : await waitUntilFlatSymbol(psym, FAST_ENTER_RETRY_MS, FLAT_POLL_MS);
+
+            console.log('FAST_ENTER flat gate (retry):', { flat2, waitMs: FAST_ENTER_RETRY_MS, psym });
+
+            if (!flat2) {
+              return { ok:false, error:'require_flat_timeout_fast_retry', sig_id: sigId, steps };
+            }
+
+            const r = await placeEntry(msg);
+
+            if (STRICT_SEQUENCE && sigId) {
+              setSigState(sigId, { lastSeq: 1, symbol: psym });
+            }
+
+            const { pendingMsg, batch, batch_error } = await flushQueuedBatchIfAny();
+
+            const recovered = (STRICT_SEQUENCE && st && st.lastSeq < 0);
+            return {
+              ok:true,
+              step: pendingMsg ? 'entry+batch' : 'entry',
+              fast_enter: true,
+              retried: true,
+              recovered_without_cancal: !!recovered,
+              self_flattened: !flatNow,
+              steps,
+              r,
+              batch,
+              batch_error
+            };
+          }
+        }
+        // -------------- end FAST ENTER mode --------------------
+
+        // Original strict wait (if FAST_ENTER off)
         if (requireFlat) {
           const flat = isScopeAll(msg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
           console.log('flat gate result:', flat);
@@ -965,4 +1071,6 @@ app.post('/tv', async (req, res) => {
   }
 });
 
-app.listen(PORT, ()=>console.log(`Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE})`));
+app.listen(PORT, ()=>console.log(
+  `Relay listening http://localhost:${PORT} (BASE=${BASE_URL}, AUTH=${AUTH_MODE}, STRICT_SEQUENCE=${STRICT_SEQUENCE}, FAST_ENTER=${FAST_ENTER})`
+));
