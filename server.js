@@ -1,7 +1,12 @@
-// server.js (FULL) — GLOBAL queue/lock, sig_id+seq idempotency,
+// server.js (FULL) — PER-SYMBOL queue/lock, sig_id+seq idempotency,
 // STRICT sequencing: expects CANCAL(seq0) -> ENTER(seq1) -> BATCH_TPS(seq2),
 // FAST_ENTER mode: try entry quickly (don’t lose margin on higher TF)
 // and retry once if exchange rejects due to not-yet-flat state.
+//
+// ✅ FIX (your CAKE/IP issue):
+// - SIG_STATE is now keyed by (sig_id|product_symbol) instead of only sig_id
+// - PENDING_BATCH is now keyed by (sig_id|product_symbol)
+// - Queue is per symbol (so multi-symbol alerts don’t block each other)
 
 require('dotenv').config();
 const express = require('express');
@@ -23,8 +28,9 @@ function isScopeAll(msg){
   return String(msg.scope||'').toUpperCase() === 'ALL' || !!msg.close_all;
 }
 function safeUpper(x){ return String(x||'').toUpperCase(); }
+function sigKey(sigId, psym){ return `${String(sigId||'')}|${safeUpper(psym||'')}`; }
 
-// ---------- global queue (serializes webhook execution) ----------
+// ---------- queue (serializes webhook execution) ----------
 const QUEUE = new Map(); // key -> Promise chain
 function enqueue(key, fn) {
   const prev = QUEUE.get(key) || Promise.resolve();
@@ -81,7 +87,7 @@ const MAX_LOTS_PER_ORDER = nnum(process.env.MAX_LOTS_PER_ORDER, 200000);
 const FLAT_TIMEOUT_MS    = nnum(process.env.FLAT_TIMEOUT_MS, 15000);
 const FLAT_POLL_MS       = nnum(process.env.FLAT_POLL_MS, 400);
 
-// ---------- FAST ENTER (NEW) ----------
+// ---------- FAST ENTER ----------
 const FAST_ENTER = String(process.env.FAST_ENTER || 'false').toLowerCase() === 'true';
 const FAST_ENTER_WAIT_MS  = nnum(process.env.FAST_ENTER_WAIT_MS, 2000);
 const FAST_ENTER_RETRY_MS = nnum(process.env.FAST_ENTER_RETRY_MS, 8000);
@@ -121,8 +127,8 @@ function rememberSeen(k){
   }
 }
 
-// ---------- STRICT sequence state (sig_id -> last seq) ----------
-const SIG_STATE = new Map();         // sig_id -> { lastSeq, ts, symbol }
+// ---------- STRICT sequence state (sig_id|symbol -> last seq) ----------
+const SIG_STATE = new Map();         // key -> { lastSeq, ts }
 const SIG_STATE_TTL_MS = 10 * 60 * 1000;
 
 function cleanupSigState(){
@@ -131,22 +137,22 @@ function cleanupSigState(){
     if (!v || (now - v.ts) > SIG_STATE_TTL_MS) SIG_STATE.delete(k);
   }
 }
-function getSigState(sig_id){
+function getSigState(sig_id, psym){
   cleanupSigState();
-  const key = String(sig_id||'');
-  if (!key) return null;
-  return SIG_STATE.get(key) || null;
+  const k = sigKey(sig_id, psym);
+  if (!sig_id || !psym) return null;
+  return SIG_STATE.get(k) || null;
 }
-function setSigState(sig_id, patch){
+function setSigState(sig_id, psym, patch){
   cleanupSigState();
-  const key = String(sig_id||'');
-  if (!key) return;
-  const prev = SIG_STATE.get(key) || { lastSeq: -1, ts: 0, symbol: '' };
-  SIG_STATE.set(key, { ...prev, ...patch, ts: Date.now() });
+  if (!sig_id || !psym) return;
+  const k = sigKey(sig_id, psym);
+  const prev = SIG_STATE.get(k) || { lastSeq: -1, ts: 0 };
+  SIG_STATE.set(k, { ...prev, ...patch, ts: Date.now() });
 }
 
-// ✅ Pending BATCH buffer (sig_id -> queued batch msg)
-const PENDING_BATCH = new Map(); // sig_id -> { msg, ts }
+// ✅ Pending BATCH buffer (sig_id|symbol -> queued batch msg)
+const PENDING_BATCH = new Map(); // key -> { msg, ts }
 const PENDING_TTL_MS = 60_000;
 
 function cleanupPendingBatch(){
@@ -155,16 +161,16 @@ function cleanupPendingBatch(){
     if (!v || (now - v.ts) > PENDING_TTL_MS) PENDING_BATCH.delete(k);
   }
 }
-function queuePendingBatch(sigId, msg){
+function queuePendingBatch(sigId, psym, msg){
   cleanupPendingBatch();
-  if (!sigId) return false;
-  PENDING_BATCH.set(String(sigId), { msg, ts: Date.now() });
+  if (!sigId || !psym) return false;
+  PENDING_BATCH.set(sigKey(sigId, psym), { msg, ts: Date.now() });
   return true;
 }
-function takePendingBatch(sigId){
+function takePendingBatch(sigId, psym){
   cleanupPendingBatch();
-  if (!sigId) return null;
-  const key = String(sigId);
+  if (!sigId || !psym) return null;
+  const key = sigKey(sigId, psym);
   const v = PENDING_BATCH.get(key) || null;
   if (v) PENDING_BATCH.delete(key);
   return v?.msg || null;
@@ -215,7 +221,7 @@ async function dcall(method, path, payload=null, query='') {
   }
 }
 
-// ---------- product + price helpers (no hardcoding) ----------
+// ---------- product + price helpers ----------
 let _products = null, _products_ts = 0;
 async function getProducts(){
   const STALE_MS = 5*60*1000;
@@ -275,7 +281,7 @@ async function getTickerPriceUSD(psym){
   } catch { return null; }
 }
 
-// ---------- sizing: amount → lots ----------
+// ---------- sizing ----------
 function lotsFromAmount({ amount, ccy='INR', leverage=DEFAULT_LEVERAGE, entryPxUSD, lotMult=1, fxInrPerUsd=FX_INR_FALLBACK }){
   leverage = Math.max(1, Math.floor(nnum(leverage, DEFAULT_LEVERAGE)));
   lotMult  = Math.max(1, Math.floor(nnum(lotMult, 1)));
@@ -300,7 +306,7 @@ function rememberSide(productSymbol, side){
 }
 function oppositeSide(side){ return (String(side||'').toLowerCase()==='buy') ? 'sell' : 'buy'; }
 
-// ---------- learning: coins-per-lot from actual position ----------
+// ---------- learning: coins-per-lot ----------
 const LAST_ENTRY_SENT = new Map(); // psym -> { lots, ts, side }
 async function learnLotMultFromPositions(psym){
   const last = LAST_ENTRY_SENT.get(psym);
@@ -452,13 +458,9 @@ async function cancelOrdersBySymbol(psym, { fallbackAll=false } = {}){
   if (!sym) return { ok:true, skipped:true, reason:'missing_symbol' };
 
   let open = [];
-  try {
-    open = await listOpenOrdersAllPages();
-  } catch(e) {
-    if (fallbackAll) {
-      await cancelAllOrders();
-      return { ok:true, fallback:'cancel_all_orders' };
-    }
+  try { open = await listOpenOrdersAllPages(); }
+  catch(e) {
+    if (fallbackAll) { await cancelAllOrders(); return { ok:true, fallback:'cancel_all_orders' }; }
     throw e;
   }
 
@@ -569,9 +571,7 @@ async function waitUntilFlat(timeoutMs = FLAT_TIMEOUT_MS, pollMs = FLAT_POLL_MS)
       const pos = await listPositionsArray();
       const hasPos = pos.some(p => Math.abs(Number(p?.size||p?.position_size||0)) > 0);
       if (!hasOrders && !hasPos) return true;
-    } catch(e) {
-      console.warn('waitUntilFlat poll error (ignoring):', e?.message || e);
-    }
+    } catch(e) {}
     await sleep(pollMs);
   }
   return false;
@@ -592,9 +592,7 @@ async function waitUntilFlatSymbol(psym, timeoutMs = FLAT_TIMEOUT_MS, pollMs = F
       const hasPos = minePos ? (Math.abs(Number(minePos?.size||minePos?.position_size||0)) > 0) : false;
 
       if (!hasOrders && !hasPos) return true;
-    } catch(e) {
-      console.warn('waitUntilFlatSymbol poll error (ignoring):', e?.message || e);
-    }
+    } catch(e) {}
     await sleep(pollMs);
   }
   return false;
@@ -724,7 +722,10 @@ app.post('/tv', async (req, res) => {
     console.log(JSON.stringify({ action, sigId, seq, symTV, psym, ts: new Date().toISOString() }));
     console.log(JSON.stringify(msg));
 
-    const out = await enqueue('GLOBAL', async () => {
+    // ✅ per-symbol queue (GLOBAL only for ALL-scope)
+    const qKey = isScopeAll(msg) ? 'GLOBAL' : `SYM:${safeUpper(psym)}`;
+
+    const out = await enqueue(qKey, async () => {
 
       const key = seenKey(msg);
       if (SEEN.has(key)) return { ok:true, dedup:true };
@@ -732,26 +733,22 @@ app.post('/tv', async (req, res) => {
 
       if (action === 'EXIT') return { ok:true, ignored:'EXIT' };
 
+      // STRICT: if sig_id is present, seq must be numeric
       if (STRICT_SEQUENCE && sigId) {
         if (!Number.isFinite(seq)) {
           return { ok:true, ignored:'missing_or_invalid_seq_in_strict_mode', sig_id: sigId, action };
         }
       }
 
+      // ✅ out-of-order guard PER (sig_id|symbol)
       if (STRICT_SEQUENCE && sigId && Number.isFinite(seq)) {
-        const st0 = getSigState(sigId) || { lastSeq: -1, symbol: psym };
-        if (st0.symbol && psym && st0.symbol.toUpperCase() !== psym.toUpperCase()) {
-          setSigState(sigId, { lastSeq: -1, symbol: psym });
-        }
-      }
-
-      if (STRICT_SEQUENCE && sigId && Number.isFinite(seq)) {
-        const st = getSigState(sigId);
+        const st = getSigState(sigId, psym);
         if (st && Number.isFinite(st.lastSeq) && st.lastSeq >= seq) {
           return {
             ok: true,
             ignored: 'out_of_order_or_duplicate_seq',
             sig_id: sigId,
+            symbol: psym,
             have_lastSeq: st.lastSeq,
             got_seq: seq,
             action
@@ -762,7 +759,7 @@ app.post('/tv', async (req, res) => {
       // --------- CANCAL / CANCEL handler ---------
       if (action === 'CANCAL' || action === 'CANCEL') {
         if (STRICT_SEQUENCE && sigId && Number.isFinite(seq) && seq !== 0) {
-          return { ok:true, ignored:'CANCAL_seq_mismatch', expected:0, got: seq, sig_id: sigId };
+          return { ok:true, ignored:'CANCAL_seq_mismatch', expected:0, got: seq, sig_id: sigId, symbol: psym };
         }
 
         if (typeof msg.cancel_orders_scope === 'undefined') msg.cancel_orders_scope = 'SYMBOL';
@@ -775,15 +772,15 @@ app.post('/tv', async (req, res) => {
           flat = isScopeAll(msg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
         }
 
-        if (STRICT_SEQUENCE && sigId) setSigState(sigId, { lastSeq: 0, symbol: psym });
+        if (STRICT_SEQUENCE && sigId) setSigState(sigId, psym, { lastSeq: 0 });
 
-        return { ok:true, did:'CANCAL', steps, flat };
+        return { ok:true, did:'CANCAL', steps, flat, symbol: psym };
       }
 
       // Bracket
       if (msg.stop_loss_order || msg.take_profit_order) {
         const r = await placeBracket(msg);
-        return { ok:true, step:'bracket', r };
+        return { ok:true, step:'bracket', r, symbol: psym };
       }
 
       // Batch (TPs)
@@ -793,18 +790,18 @@ app.post('/tv', async (req, res) => {
 
         if (STRICT_SEQUENCE) {
           if (!sigId) return { ok:true, ignored:'BATCH_TPS_missing_sig_id' };
-          const st = getSigState(sigId);
+          const st = getSigState(sigId, psym);
           if (!st || st.lastSeq < 1) {
-            queuePendingBatch(sigId, msg);
-            return { ok:true, queued:'BATCH_TPS_waiting_for_ENTER', sig_id: sigId, have: st ? st.lastSeq : null };
+            queuePendingBatch(sigId, psym, msg);
+            return { ok:true, queued:'BATCH_TPS_waiting_for_ENTER', sig_id: sigId, symbol: psym, have: st ? st.lastSeq : null };
           }
         }
 
         const r = await placeBatch(msg);
 
-        if (STRICT_SEQUENCE && sigId) setSigState(sigId, { lastSeq: 2, symbol: psym });
+        if (STRICT_SEQUENCE && sigId) setSigState(sigId, psym, { lastSeq: 2 });
 
-        return { ok:true, step:'batch', r };
+        return { ok:true, step:'batch', r, symbol: psym };
       }
 
       // ENTER / FLIP
@@ -815,10 +812,10 @@ app.post('/tv', async (req, res) => {
           if (Number.isFinite(seq) && seq !== 1) return { ok:true, ignored:'ENTER_seq_mismatch', expected:1, got: msg.seq };
         }
 
-        const st = (STRICT_SEQUENCE && sigId) ? (getSigState(sigId) || { lastSeq: -1, symbol: psym }) : null;
+        const st = (STRICT_SEQUENCE && sigId) ? (getSigState(sigId, psym) || { lastSeq: -1 }) : null;
 
         if (STRICT_SEQUENCE && st && st.lastSeq >= 1) {
-          return { ok:true, ignored:'ENTER_already_seen', sig_id: sigId, have: st.lastSeq };
+          return { ok:true, ignored:'ENTER_already_seen', sig_id: sigId, symbol: psym, have: st.lastSeq };
         }
 
         const requireFlat = (typeof msg.require_flat === 'undefined') ? true : !!msg.require_flat;
@@ -835,40 +832,31 @@ app.post('/tv', async (req, res) => {
 
         const steps = await flattenFromMsg(msg, psym);
 
-        // -------- FAST ENTER GATE (NEW) --------
+        // -------- FAST ENTER GATE --------
         if (requireFlat && FAST_ENTER) {
           const flatQuick = isScopeAll(msg)
             ? await waitUntilFlat(FAST_ENTER_WAIT_MS, FLAT_POLL_MS)
             : await waitUntilFlatSymbol(psym, FAST_ENTER_WAIT_MS, FLAT_POLL_MS);
 
-          console.log('FAST_ENTER quick-flat:', { flatQuick, waitMs: FAST_ENTER_WAIT_MS });
+          console.log('FAST_ENTER quick-flat:', { symbol: psym, flatQuick, waitMs: FAST_ENTER_WAIT_MS });
 
           try {
             const r = await placeEntry(msg);
 
-            if (STRICT_SEQUENCE && sigId) setSigState(sigId, { lastSeq: 1, symbol: psym });
+            if (STRICT_SEQUENCE && sigId) setSigState(sigId, psym, { lastSeq: 1 });
 
             let batch = null, batch_error = null;
-            const pendingMsg = STRICT_SEQUENCE && sigId ? takePendingBatch(sigId) : null;
+            const pendingMsg = STRICT_SEQUENCE && sigId ? takePendingBatch(sigId, psym) : null;
             if (pendingMsg) {
               try {
                 batch = await placeBatch(pendingMsg);
-                if (STRICT_SEQUENCE && sigId) setSigState(sigId, { lastSeq: 2, symbol: psym });
+                if (STRICT_SEQUENCE && sigId) setSigState(sigId, psym, { lastSeq: 2 });
               } catch (e) {
                 batch_error = String(e?.message || e);
               }
             }
 
-            return {
-              ok:true,
-              step: pendingMsg ? 'entry+batch' : 'entry',
-              fast_enter: true,
-              flat_quick: flatQuick,
-              steps,
-              r,
-              batch,
-              batch_error
-            };
+            return { ok:true, step: pendingMsg ? 'entry+batch' : 'entry', fast_enter:true, flat_quick: flatQuick, steps, r, batch, batch_error, symbol: psym };
 
           } catch (e) {
             console.warn('FAST_ENTER first attempt failed:', e?.message || e);
@@ -877,80 +865,60 @@ app.post('/tv', async (req, res) => {
               ? await waitUntilFlat(FAST_ENTER_RETRY_MS, FLAT_POLL_MS)
               : await waitUntilFlatSymbol(psym, FAST_ENTER_RETRY_MS, FLAT_POLL_MS);
 
-            console.log('FAST_ENTER retry-flat:', { flatRetry, retryMs: FAST_ENTER_RETRY_MS });
+            console.log('FAST_ENTER retry-flat:', { symbol: psym, flatRetry, retryMs: FAST_ENTER_RETRY_MS });
 
-            if (!flatRetry) return { ok:false, error:'require_flat_timeout_fast_retry', sig_id: sigId, steps };
+            if (!flatRetry) return { ok:false, error:'require_flat_timeout_fast_retry', sig_id: sigId, symbol: psym, steps };
 
             const r = await placeEntry(msg);
 
-            if (STRICT_SEQUENCE && sigId) setSigState(sigId, { lastSeq: 1, symbol: psym });
+            if (STRICT_SEQUENCE && sigId) setSigState(sigId, psym, { lastSeq: 1 });
 
             let batch = null, batch_error = null;
-            const pendingMsg = STRICT_SEQUENCE && sigId ? takePendingBatch(sigId) : null;
+            const pendingMsg = STRICT_SEQUENCE && sigId ? takePendingBatch(sigId, psym) : null;
             if (pendingMsg) {
               try {
                 batch = await placeBatch(pendingMsg);
-                if (STRICT_SEQUENCE && sigId) setSigState(sigId, { lastSeq: 2, symbol: psym });
+                if (STRICT_SEQUENCE && sigId) setSigState(sigId, psym, { lastSeq: 2 });
               } catch (err) {
                 batch_error = String(err?.message || err);
               }
             }
 
-            return {
-              ok:true,
-              step: pendingMsg ? 'entry+batch' : 'entry',
-              fast_enter: true,
-              flat_retry: flatRetry,
-              steps,
-              r,
-              batch,
-              batch_error
-            };
+            return { ok:true, step: pendingMsg ? 'entry+batch' : 'entry', fast_enter:true, flat_retry: flatRetry, steps, r, batch, batch_error, symbol: psym };
           }
         }
 
         // -------- Original strict wait (if FAST_ENTER off) --------
         if (requireFlat && !FAST_ENTER) {
           const flat = isScopeAll(msg) ? await waitUntilFlat() : await waitUntilFlatSymbol(psym);
-          console.log('flat gate result:', flat);
-          if (!flat) return { ok:false, error:'require_flat_timeout', sig_id: sigId, steps };
+          console.log('flat gate result:', { symbol: psym, flat });
+          if (!flat) return { ok:false, error:'require_flat_timeout', sig_id: sigId, symbol: psym, steps };
         }
 
         const r = await placeEntry(msg);
 
-        if (STRICT_SEQUENCE && sigId) setSigState(sigId, { lastSeq: 1, symbol: psym });
+        if (STRICT_SEQUENCE && sigId) setSigState(sigId, psym, { lastSeq: 1 });
 
         let batch = null, batch_error = null;
-        const pendingMsg = STRICT_SEQUENCE && sigId ? takePendingBatch(sigId) : null;
+        const pendingMsg = STRICT_SEQUENCE && sigId ? takePendingBatch(sigId, psym) : null;
         if (pendingMsg) {
           try {
             batch = await placeBatch(pendingMsg);
-            if (STRICT_SEQUENCE && sigId) setSigState(sigId, { lastSeq: 2, symbol: psym });
+            if (STRICT_SEQUENCE && sigId) setSigState(sigId, psym, { lastSeq: 2 });
           } catch (e) {
             batch_error = String(e?.message || e);
           }
         }
 
-        const recovered = (STRICT_SEQUENCE && st && st.lastSeq < 0);
-
-        return {
-          ok:true,
-          step: pendingMsg ? 'entry+batch' : 'entry',
-          recovered_without_cancal: !!recovered,
-          self_flattened: requireFlat ? (!flatNow) : false,
-          steps,
-          r,
-          batch,
-          batch_error
-        };
+        return { ok:true, step: pendingMsg ? 'entry+batch' : 'entry', steps, r, batch, batch_error, symbol: psym };
       }
 
       if (STRICT_SEQUENCE) {
-        return { ok:true, ignored:'unknown_action_in_strict_mode', action, sig_id: sigId, seq: msg.seq };
+        return { ok:true, ignored:'unknown_action_in_strict_mode', action, sig_id: sigId, seq: msg.seq, symbol: psym };
       }
 
       const r = await placeEntry(msg);
-      return { ok:true, step:'entry', r };
+      return { ok:true, step:'entry', r, symbol: psym };
     });
 
     return res.json(out);
