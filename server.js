@@ -15,6 +15,11 @@
 //
 // ✅ DEDUPE FIX:
 // - seenKey() now includes orders hash when present so duplicate BATCH alerts dedupe correctly
+//
+// ✅ NEXT-BAR BATCH CORRECTIONS (added):
+// - Allow BATCH_TPS to arrive on the next bar even if sig_id drifted or sig_id/seq missing,
+//   as long as we recently placed an entry for that symbol (LAST_ENTRY_SENT window).
+// - STRICT seq numeric enforcement is relaxed for BATCH_TPS only (so "sig_id but no seq" won't be dropped).
 
 require('dotenv').config();
 const express = require('express');
@@ -102,6 +107,9 @@ const FAST_ENTER_RETRY_MS = nnum(process.env.FAST_ENTER_RETRY_MS, 8000);
 
 // ---------- STRICT sequence (default ON) ----------
 const STRICT_SEQUENCE = String(process.env.STRICT_SEQUENCE || 'true').toLowerCase() !== 'false';
+
+// ✅ NEXT-BAR BATCH SAFETY WINDOW (default 120s)
+const BATCH_AFTER_ENTER_WINDOW_MS = nnum(process.env.BATCH_AFTER_ENTER_WINDOW_MS, 120_000);
 
 // ---------- idempotency (drops dupes ~60s) ----------
 const SEEN = new Map();              // key -> ts(ms)
@@ -815,13 +823,16 @@ app.post('/tv', async (req, res) => {
       if (action === 'EXIT') return { ok:true, ignored:'EXIT' };
 
       // STRICT: if sig_id is present, seq must be numeric
+      // ✅ but relax this for BATCH_TPS (next-bar alerts sometimes omit seq)
       if (STRICT_SEQUENCE && sigId) {
-        if (!Number.isFinite(seq)) {
+        const allowMissingSeq = (action === 'BATCH_TPS');
+        if (!Number.isFinite(seq) && !allowMissingSeq) {
           return { ok:true, ignored:'missing_or_invalid_seq_in_strict_mode', sig_id: sigId, action };
         }
       }
 
       // ✅ out-of-order guard PER (sig_id|symbol)
+      // (only applies when seq is numeric)
       if (STRICT_SEQUENCE && sigId && Number.isFinite(seq)) {
         const st = getSigState(sigId, psym);
         if (st && Number.isFinite(st.lastSeq) && st.lastSeq >= seq) {
@@ -870,11 +881,23 @@ app.post('/tv', async (req, res) => {
         if (Number.isFinite(seq) && seq !== 2) return { ok:true, ignored:'batch_seq_mismatch', expected:2, got: msg.seq };
 
         if (STRICT_SEQUENCE) {
-          if (!sigId) return { ok:true, ignored:'BATCH_TPS_missing_sig_id' };
-          const st = getSigState(sigId, psym);
-          if (!st || st.lastSeq < 1) {
-            queuePendingBatch(sigId, psym, msg);
-            return { ok:true, queued:'BATCH_TPS_waiting_for_ENTER', sig_id: sigId, symbol: psym, have: st ? st.lastSeq : null };
+          // ✅ Next-bar tolerance: allow batch if we recently placed entry for this symbol
+          const lastEnt = LAST_ENTRY_SENT.get(psym);
+          const recentEnter = !!(lastEnt && (Date.now() - lastEnt.ts) <= BATCH_AFTER_ENTER_WINDOW_MS);
+
+          // If no sig_id, we can only proceed on recent-enter (otherwise ignore)
+          if (!sigId) {
+            if (!recentEnter) {
+              return { ok:true, ignored:'BATCH_TPS_missing_sig_id_no_recent_enter', symbol: psym };
+            }
+            // proceed best-effort
+          } else {
+            const st = getSigState(sigId, psym);
+            if ((!st || st.lastSeq < 1) && !recentEnter) {
+              queuePendingBatch(sigId, psym, msg);
+              return { ok:true, queued:'BATCH_TPS_waiting_for_ENTER', sig_id: sigId, symbol: psym, have: st ? st.lastSeq : null };
+            }
+            // else proceed (either proper state OR recent-enter fallback)
           }
         }
 
